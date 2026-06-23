@@ -11,12 +11,14 @@
 *.tclrq
 *.library
 *.compiled-library
-*.compileinfo          # regenerated on download; needed only for core-dump analysis
+# *.compileinfo is regenerated on download; needed only for core-dump analysis
+*.compileinfo
 *.bootinfo
 *.bootinfo_guids
 *.asm
 *.core
-*.~u                   # CODESYS/TwinCAT temporary "unsaved project" file (e.g. kayma.~u)
+# CODESYS/TwinCAT temporary "unsaved project" file (e.g. kayma.~u)
+*.~u
 LineIDs.dbg
 LineIDs.dbg.bak
 

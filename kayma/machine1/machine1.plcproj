@@ -149,11 +149,6 @@
       <SubType>Content</SubType>
     </None>
   </ItemGroup>
-  <ItemGroup>
-    <Content Include=".gitignore">
-      <SubType>Content</SubType>
-    </Content>
-  </ItemGroup>
   <ProjectExtensions>
     <PlcProjectOptions>
       <XmlArchive>
