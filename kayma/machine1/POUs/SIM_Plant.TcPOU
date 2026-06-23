@@ -1,0 +1,114 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="SIM_Plant" Id="{fd05fa55-ef7f-4ba0-8738-94206af72d33}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM SIM_Plant
+//==================================================================
+// PLANT SIMULATOR - drives the GVL_IO *inputs* from the GVL_IO outputs
+// so the aligned sequence can run without hardware. Stroke/valve times
+// are set INSIDE the watchdog limits (T2/T3/T4/T6) so a clean demo
+// never faults. Set bSimEnable := FALSE for real I/O.
+//==================================================================
+VAR
+    bSimEnable       : BOOL := TRUE;     // master enable
+    bSimAutoStart    : BOOL := FALSE;    // TRUE = kick the machine into AUTO once (demo).
+                                         // Default FALSE: boots in MANUAL, as specified.
+
+    // ---- simulated mechanical times (must stay < the matching watchdog) ----
+    tSimPistonStroke : TIME := T#2S;     // piston travel  (< T3 / T4 = 3 s)
+    tSimValveStroke  : TIME := T#300MS;  // SPX valve open/close (< T2 / T6 = 0.5 s)
+    tSimMoldMove     : TIME := T#1S;     // mother moves mold to spray height (< T1 = 4 s)
+    tSimStartGap     : TIME := T#2S;     // settle time before the demo auto-kick
+
+    // ---- timers ----
+    tonPOpen   : TON;
+    tonPClose  : TON;
+    tonSPXO    : TON;
+    tonSPXC    : TON;
+    tonMold    : TON;
+    tonStart   : TON;
+    rtStartGap : R_TRIG;
+    bAutoKicked : BOOL;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// Simulation off -> leave every input to the real I/O.
+IF NOT bSimEnable THEN
+    RETURN;
+END_IF
+
+//------------------------------------------------------------------
+// Mother handshake: mother is always ready in the demo, so each time
+// the cycle returns to idle it hands control over again (cycles loop).
+//------------------------------------------------------------------
+GVL_IO.bSprayFeasible := TRUE;
+
+//------------------------------------------------------------------
+// Piston position sensors (P-close / P-open) follow the solenoids.
+//   leaving an end clears that end immediately; reaching the far end
+//   takes tSimPistonStroke.
+//------------------------------------------------------------------
+tonPOpen (IN := GVL_IO.bPistonOpenSol,  PT := tSimPistonStroke);
+tonPClose(IN := GVL_IO.bPistonCloseSol, PT := tSimPistonStroke);
+
+IF GVL_IO.bPistonOpenSol THEN
+    GVL_IO.bPistonClosed := FALSE;
+    GVL_IO.bPistonOpen   := tonPOpen.Q;
+ELSIF GVL_IO.bPistonCloseSol THEN
+    GVL_IO.bPistonOpen   := FALSE;
+    GVL_IO.bPistonClosed := tonPClose.Q;
+END_IF
+
+//------------------------------------------------------------------
+// SPX valve traffic-light follows the SPX valve command.
+//------------------------------------------------------------------
+tonSPXO(IN := GVL_IO.bSPXValve,     PT := tSimValveStroke);
+tonSPXC(IN := NOT GVL_IO.bSPXValve, PT := tSimValveStroke);
+
+IF GVL_IO.bSPXValve THEN
+    GVL_IO.bSPXFullyClose := FALSE;
+    GVL_IO.bSPXFullyOpen  := tonSPXO.Q;
+ELSE
+    GVL_IO.bSPXFullyOpen  := FALSE;
+    GVL_IO.bSPXFullyClose := tonSPXC.Q;
+END_IF
+
+//------------------------------------------------------------------
+// Mold reaches spray height shortly after we take control (busy).
+//------------------------------------------------------------------
+tonMold(IN := GVL_IO.bSprayBusy, PT := tSimMoldMove);
+GVL_IO.bMoldAtSprayHigh := tonMold.Q;
+
+//------------------------------------------------------------------
+// Analog inputs.  Level mid-range (no level warnings); SPX pressure
+// eases toward ~1.72 bar while spraying (within tolerance of 1.70).
+//------------------------------------------------------------------
+GVL_IO.rSPXLevel := 60.0;
+
+IF GVL_IO.bSPXValve THEN
+    GVL_IO.rSPXPressure := GVL_IO.rSPXPressure + (1.72 - GVL_IO.rSPXPressure) * 0.3;
+ELSE
+    GVL_IO.rSPXPressure := GVL_IO.rSPXPressure + (1.50 - GVL_IO.rSPXPressure) * 0.1;
+END_IF
+
+IF GVL_IO.bAirValve THEN
+    GVL_IO.rAirPressure := GVL_IO.rAirPressure + (28.0 - GVL_IO.rAirPressure) * 0.3;
+ELSE
+    GVL_IO.rAirPressure := GVL_IO.rAirPressure + (5.0 - GVL_IO.rAirPressure) * 0.1;
+END_IF
+
+//------------------------------------------------------------------
+// Demo kick-off: pulse the AUTO toggle ONCE after boot (if enabled).
+// Cycles then loop on their own (machine stays armed in AUTO), so we
+// must NOT pulse again - a second pulse would disarm AUTO.
+//------------------------------------------------------------------
+tonStart(IN := bSimAutoStart AND NOT bAutoKicked AND (MAIN.eState = E_SeqState.eIdle),
+         PT := tSimStartGap);
+rtStartGap(CLK := tonStart.Q);
+GVL_IO.bAutoToggleHW := rtStartGap.Q;
+IF rtStartGap.Q THEN
+    bAutoKicked := TRUE;
+END_IF
+]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

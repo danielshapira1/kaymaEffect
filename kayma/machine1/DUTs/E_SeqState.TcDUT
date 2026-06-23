@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <DUT Name="E_SeqState" Id="{34a0a86b-4c39-4f89-9789-036bb702eb45}">
+    <Declaration><![CDATA[
+{attribute 'strict'}
+{attribute 'to_string'}
+TYPE E_SeqState :
+(
+    eIdle         := 0,    // S0 - outputs safe, circulation on; wait for the mother handshake
+    eDewater      := 10,   // S1 - T1 dewater (suck slurry); move mold to spray height
+    eSprayOpen    := 20,   // S2 - open Air+SPX, piston OPENING; watchdogs T2 (valve) & T3 (piston)
+    eSprayClose   := 30,   // S3 - piston CLOSING; watchdog T4; spraying continues
+    eCloseDewater := 40,   // S4 - close Air+SPX (watchdog T6); T5 dewater; then release mother
+    eFault        := 100   // FAULT - safe, latched until reset
+) INT;
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

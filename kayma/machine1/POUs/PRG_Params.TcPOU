@@ -1,0 +1,107 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="PRG_Params" Id="{52dbbb35-4ad0-4a15-a383-0a45b86999a4}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM PRG_Params
+//==================================================================
+// MACHINE PARAMETERS SCREEN  (page 1)
+//   The operator edits the *Edit* copies (tap a value -> numeric keypad);
+//   LOAD pulls the live values in, APPLY writes them to GVL_Param.
+//
+//   The time fields are edited as REAL SECONDS (so the HMI keypad shows
+//   plain decimals: 4, 0.5, 3.0, 10) and converted to TIME on apply.
+//   The HMI groups two pairs into one value each:
+//     "T2 & T6" -> rEditValveMax_s   (writes both watchdogs)
+//     "T3 & T4" -> rEditSprayTime_s   (writes both watchdogs)
+//   APPLY is only accepted while the sequence is idle.
+//==================================================================
+VAR
+    // ---- editable copies in SECONDS (bound to the HMI keypad fields) ----
+    rEditDewater_s    : REAL;   // T1 : Dewater time            [s]
+    rEditValveMax_s   : REAL;   // T2 & T6 : valve max open/close[s]
+    rEditSprayTime_s  : REAL;   // T3 & T4 : max spraying time   [s]
+    rEditSPXDewater_s : REAL;   // T5 : SPX Dewater time         [s]
+    rEditPressTarget  : REAL;   // SPX Pressure target           [bar]
+    rEditPumpSpeed    : REAL;   // Pump speed                    [Hz]
+
+    // ---- buttons ----
+    bBtnApply : BOOL;          // "Apply" (write edits to GVL_Param)
+    bBtnLoad  : BOOL;          // "Reload" (discard edits, pull live values)
+
+    // ---- status ----
+    bApplyAllowed : BOOL;      // TRUE while edits may be applied (idle)
+    sParamStatus  : STRING := 'Ready';
+    bInit         : BOOL;      // first-scan load
+
+    // ---- 5 s message window (drives HMI message visibility) ----
+    bMsgVisible : BOOL;        // TRUE for 5 s after Apply, then FALSE
+    bMsgTrig    : BOOL;        // one-scan trigger (Apply pressed)
+    tonMsg      : TON;         // 5 s display timer
+END_VAR
+
+VAR CONSTANT
+    rMS_PER_S  : REAL := 1000.0;
+    tMSG_SHOW  : TIME := T#3S;   // how long the status / banner stays visible
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// On the first scan, pull the live parameters into the edit copies.
+bMsgTrig := FALSE;   // reset the one-scan message trigger
+
+IF NOT bInit THEN
+    bInit    := TRUE;
+    bBtnLoad := TRUE;
+END_IF
+
+// Parameters may only be applied while the sequence is idle.
+bApplyAllowed := (MAIN.eState = E_SeqState.eIdle);
+
+// ---- LOAD: live (TIME) -> edit copies (REAL seconds) ----
+IF bBtnLoad THEN
+    bBtnLoad := FALSE;
+    rEditDewater_s    := DINT_TO_REAL(TIME_TO_DINT(GVL_Param.tDewaterTime))     / rMS_PER_S;
+    rEditValveMax_s   := DINT_TO_REAL(TIME_TO_DINT(GVL_Param.tSPXMaxOpenTime))  / rMS_PER_S;
+    rEditSprayTime_s  := DINT_TO_REAL(TIME_TO_DINT(GVL_Param.tSprayOpenTime))   / rMS_PER_S;
+    rEditSPXDewater_s := DINT_TO_REAL(TIME_TO_DINT(GVL_Param.tSPXDewaterTime))  / rMS_PER_S;
+    rEditPressTarget  := GVL_Param.rSPXPressureTarget;
+    rEditPumpSpeed    := GVL_Param.rPumpSpeedBase;
+    sParamStatus      := 'Loaded';
+END_IF
+
+// ---- APPLY: edit copies (REAL seconds) -> live (TIME), idle + sanity ----
+IF bBtnApply THEN
+    bBtnApply := FALSE;
+    bMsgTrig  := TRUE;     // show the status (and the manual banner) for 3 s
+    IF NOT bApplyAllowed THEN
+        sParamStatus := 'Rejected: sequence not idle';
+    ELSIF (rEditDewater_s <= 0.0) OR (rEditValveMax_s <= 0.0) OR (rEditSprayTime_s <= 0.0)
+       OR (rEditSPXDewater_s <= 0.0) OR (rEditPumpSpeed <= 0.0) THEN
+        sParamStatus := 'Rejected: values must be > 0';
+    ELSE
+        // seconds -> milliseconds -> TIME
+        GVL_Param.tDewaterTime       := DINT_TO_TIME(REAL_TO_DINT(rEditDewater_s    * rMS_PER_S));
+        GVL_Param.tSPXMaxOpenTime    := DINT_TO_TIME(REAL_TO_DINT(rEditValveMax_s   * rMS_PER_S));  // T2
+        GVL_Param.tSPXMaxCloseTime   := DINT_TO_TIME(REAL_TO_DINT(rEditValveMax_s   * rMS_PER_S));  // T6 (shares value)
+        GVL_Param.tSprayOpenTime     := DINT_TO_TIME(REAL_TO_DINT(rEditSprayTime_s  * rMS_PER_S));  // T3
+        GVL_Param.tSprayCloseTime    := DINT_TO_TIME(REAL_TO_DINT(rEditSprayTime_s  * rMS_PER_S));  // T4 (shares value)
+        GVL_Param.tSPXDewaterTime    := DINT_TO_TIME(REAL_TO_DINT(rEditSPXDewater_s * rMS_PER_S));
+        GVL_Param.rSPXPressureTarget := rEditPressTarget;
+        GVL_Param.rPumpSpeedBase     := rEditPumpSpeed;
+        sParamStatus := 'Applied';
+    END_IF
+END_IF
+
+// ---- 5 s message window ----
+//   bMsgVisible goes TRUE on Apply and stays TRUE for tMSG_SHOW, then drops.
+//   The HMI binds the status text / manual banner "Invisible" to NOT this flag.
+IF bMsgTrig THEN
+    bMsgVisible := TRUE;
+    tonMsg(IN := FALSE);              // restart the window on each press
+END_IF
+tonMsg(IN := bMsgVisible, PT := tMSG_SHOW);
+IF tonMsg.Q THEN
+    bMsgVisible := FALSE;
+END_IF
+]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

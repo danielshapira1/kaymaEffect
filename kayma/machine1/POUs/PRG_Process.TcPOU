@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="PRG_Process" Id="{4e3f6081-ac12-4d43-be5f-7091c3d4e5f6}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM PRG_Process
+//==================================================================
+// PROCESS SUPERVISION  (spec slide 10 - "general")
+//   1) SPX tank level monitoring (warnings + empty lockout)
+//   2) gear-pump speed: P-only control, updated once per cycle
+//   3) circulation-pressure sanity check
+//
+//   *** The pump gain/limits are the values the spec left open
+//       ("?? find the Hz amount"). They live in GVL_Param and must be
+//       tuned on the machine - the STRUCTURE here is complete. ***
+//==================================================================
+VAR
+    rtCycleEnd : R_TRIG;   // fires when a spray cycle finishes (busy 1 -> 0)
+    bWasBusy   : BOOL;     // previous-scan bSprayBusy
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[//------------------------------------------------------------------
+// 1) SPX TANK LEVEL MONITORING
+//------------------------------------------------------------------
+GVL_Process.bWarnLevelHigh := GVL_IO.rSPXLevel > GVL_Param.rLevelHigh;   // > 95%
+GVL_Process.bWarnLevelLow  := GVL_IO.rSPXLevel < GVL_Param.rLevelLow;    // < 20%
+GVL_Process.bLevelEmpty    := GVL_IO.rSPXLevel < GVL_Param.rLevelEmpty;  // < 5%  -> halt
+
+//------------------------------------------------------------------
+// 2) GEAR-PUMP SPEED  -  P-only, updated at the END of each cycle
+//   End of cycle = bSprayBusy falls 1 -> 0 after a normal release.
+//   On a fault MAIN drops bSprayBusy too, so gate on NOT bError.
+//------------------------------------------------------------------
+rtCycleEnd(CLK := bWasBusy AND NOT GVL_IO.bSprayBusy);
+bWasBusy := GVL_IO.bSprayBusy;
+
+IF rtCycleEnd.Q AND NOT MAIN.bError THEN
+    // combined spray-pressure average for the cycle
+    GVL_Process.rSPXAvg := (GVL_Process.rSPXAvgT3 + GVL_Process.rSPXAvgT4) * 0.5;
+
+    // P correction with deadband:
+    //   measured too HIGH -> slow the pump down
+    //   measured too LOW  -> speed the pump up
+    // "double the difference" from the spec is captured by rPumpKp (TBD).
+    IF (GVL_Process.rSPXAvg - GVL_Param.rSPXPressureTarget) > GVL_Param.rPumpDeadband THEN
+        GVL_IO.rPumpHz := GVL_IO.rPumpHz
+                        - GVL_Param.rPumpKp * (GVL_Process.rSPXAvg - GVL_Param.rSPXPressureTarget);
+    ELSIF (GVL_Param.rSPXPressureTarget - GVL_Process.rSPXAvg) > GVL_Param.rPumpDeadband THEN
+        GVL_IO.rPumpHz := GVL_IO.rPumpHz
+                        + GVL_Param.rPumpKp * (GVL_Param.rSPXPressureTarget - GVL_Process.rSPXAvg);
+    END_IF
+
+    // clamp to the configured pump window
+    GVL_IO.rPumpHz := LIMIT(GVL_Param.rPumpHzMin, GVL_IO.rPumpHz, GVL_Param.rPumpHzMax);
+
+    // circulation-pressure sanity: spray avg vs circulation avg
+    GVL_Process.bWarnCircPress :=
+        ABS(GVL_Process.rSPXAvg - GVL_Process.rSPXAvgCirc) > GVL_Param.rCircPressTol;
+END_IF
+
+// initialise the pump to the base setpoint on the first scan (or after a refill)
+IF GVL_IO.rPumpHz <= 0.0 AND NOT GVL_Process.bLevelEmpty THEN
+    GVL_IO.rPumpHz := GVL_Param.rPumpSpeedBase;
+END_IF
+
+//------------------------------------------------------------------
+// 3) TANK-EMPTY LOCKOUT  -  stop the pump (release is blocked in MAIN)
+//------------------------------------------------------------------
+IF GVL_Process.bLevelEmpty THEN
+    GVL_IO.rPumpHz := 0.0;
+END_IF
+]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

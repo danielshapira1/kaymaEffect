@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <GVL Name="GVL_Nav" Id="{6d0e9723-d027-4d1f-a74a-5cfa7504b963}">
+    <Declaration><![CDATA[// Navigation state shared by the screen programs.
+// Two screens now, per the spec.
+{attribute 'qualified_only'}
+VAR_GLOBAL
+    nPage       : INT;                   // 0 = Spray System, 1 = Machine Parameters
+    abNavActive : ARRAY[0..1] OF BOOL;   // highlight for the active nav button
+END_VAR
+]]></Declaration>
+  </GVL>
+</TcPlcObject>

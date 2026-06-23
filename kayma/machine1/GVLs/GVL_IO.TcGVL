@@ -1,0 +1,47 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <GVL Name="GVL_IO" Id="{2c1d4e6f-8a90-4b21-9c3d-5e7f1a2b3c4d}">
+    <Declaration><![CDATA[// Physical process I/O, named per the Alfa/Brazil spec.
+// Moved out of MAIN's VAR_INPUT/VAR_OUTPUT because several programs now
+// touch these signals (MAIN sequence, PRG_Process supervision, PRG_Spray
+// HMI, SIM_Plant). A GVL is the standard shared home - same reason the
+// machine parameters already live in GVL_Param.
+//
+// For real hardware: replace ';' with the AT %I*/%Q* mappings noted on
+// each line and set SIM_Plant.bSimEnable := FALSE.
+{attribute 'qualified_only'}
+VAR_GLOBAL
+    // ============ DIGITAL INPUTS (0-24 V) ============
+    // ---- SPX-valve traffic-light feedback ----
+    bSPXFullyOpen    : BOOL;   // SPX valve reported FULLY OPEN     // AT %I*
+    bSPXFullyClose   : BOOL;   // SPX valve reported FULLY CLOSED   // AT %I*
+    // ---- piston position sensors (from the mother machine) ----
+    bPistonClosed    : BOOL;   // 'P-close' - piston at closed end  // AT %I*
+    bPistonOpen      : BOOL;   // 'P-open'  - piston at open end    // AT %I*
+    // ---- mother-machine handshake ----
+    bSprayFeasible   : BOOL;   // mother in position & waiting: we may run   // AT %I*
+    bMoldAtSprayHigh : BOOL;   // 'spray height' - mold reached spray pos    // AT %I*
+    // ---- operator pushbuttons (OR-ed with the HMI buttons in MAIN) ----
+    bAutoToggleHW    : BOOL;   // HW AUTO/STOP toggle               // AT %I*
+    bResetHW         : BOOL;   // HW fault reset                    // AT %I*
+
+    // ============ ANALOG INPUTS (4-20 mA, scaled to engineering units) ============
+    rSPXLevel        : REAL;   // SPX tank level  [%]               // AT %I* (scaled)
+    rSPXPressure     : REAL;   // SPX pressure    [bar]             // AT %I* (scaled)
+    rAirPressure     : REAL;   // Air pressure    [bar]             // AT %I* (scaled)
+
+    // ============ DIGITAL OUTPUTS (0-24 V) ============
+    bAirValve        : BOOL;   // air valve solenoid                // AT %Q*
+    bSPXValve        : BOOL;   // SPX valve - command OPEN          // AT %Q*
+    bCircValve       : BOOL;   // circulation valve = NOT bSPXValve // AT %Q*
+    bPistonOpenSol   : BOOL;   // piston OPEN  solenoid (or mother cmd)  // AT %Q*
+    bPistonCloseSol  : BOOL;   // piston CLOSE solenoid (or mother cmd)  // AT %Q*
+    bGoToCleaningPos : BOOL;   // command mother: move mold to spray height  // AT %Q*
+    bSprayBusy       : BOOL;   // handshake to mother: we are running (mother waits)  // AT %Q*
+
+    // ============ ANALOG OUTPUT (4-20 mA) ============
+    rPumpHz          : REAL;   // gear-pump VFD speed setpoint [Hz] // AT %Q* (scaled)
+END_VAR
+]]></Declaration>
+  </GVL>
+</TcPlcObject>

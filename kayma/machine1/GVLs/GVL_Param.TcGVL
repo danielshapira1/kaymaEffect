@@ -1,0 +1,34 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <GVL Name="GVL_Param" Id="{8b4f0c21-7d3e-4a96-b1c5-2e9d4f7a6310}">
+    <Declaration><![CDATA[// Machine parameters - persistent, writable from PRG_Params, read everywhere.
+// Defaults match the "Machine Parameters" screen in the spec.
+//   *** marks values the spec left open ("??"/"X"); tune on the machine. ***
+{attribute 'qualified_only'}
+VAR_GLOBAL PERSISTENT
+    // ===== sequence timers (HMI "Machine Parameters" page) =====
+    tDewaterTime       : TIME := T#4S;     // T1 - dewater / suck slurry            [operator]
+    tSPXMaxOpenTime    : TIME := T#500MS;  // T2 - SPX valve must report OPEN  within this  [engineer]
+    tSPXMaxCloseTime   : TIME := T#500MS;  // T6 - SPX valve must report CLOSE within this  [engineer]  (HMI groups T2&T6)
+    tSprayOpenTime     : TIME := T#3S;     // T3 - piston OPEN  stroke watchdog (P-close->P-open) [engineer]
+    tSprayCloseTime    : TIME := T#3S;     // T4 - piston CLOSE stroke watchdog (P-open->P-close) [engineer]  (HMI groups T3&T4)
+    tSPXDewaterTime    : TIME := T#10S;    // T5 - dewater after closing            [operator]
+
+    // ===== pressure / pump (HMI "Machine Parameters" page) =====
+    rSPXPressureTarget : REAL := 1.7;      // SPX target pressure [bar]
+    rPumpSpeedBase     : REAL := 15.0;     // gear-pump base speed [Hz] (P-control starts here)
+
+    // ===== thresholds & gains (engineer; not on the operator page) =====
+    rSPXPressTol       : REAL := 0.1;      // |avg-target| >= this  -> "bad SPX pressure" warning
+    rPumpDeadband      : REAL := 0.02;     // P-control deadband [bar]
+    rPumpKp            : REAL := 2.0;      // *** P-control gain [Hz per bar] - spec: "double the difference??" ***
+    rPumpHzMin         : REAL := 5.0;      // *** pump speed clamp, low  [Hz] ***
+    rPumpHzMax         : REAL := 50.0;     // *** pump speed clamp, high [Hz] ***
+    rLevelHigh         : REAL := 95.0;     // SPX tank: warn above [%]
+    rLevelLow          : REAL := 20.0;     // SPX tank: warn below [%]
+    rLevelEmpty        : REAL := 5.0;      // SPX tank: below -> stop pump & block mother release [%]
+    rCircPressTol      : REAL := 0.5;      // spray-avg vs circulation-avg > this -> "adjust" message
+END_VAR
+]]></Declaration>
+  </GVL>
+</TcPlcObject>

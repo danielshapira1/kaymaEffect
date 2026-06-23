@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="PRG_Spray" Id="{7e3a9c14-5b62-4d08-9f1a-2c6e8b4d3a05}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM PRG_Spray
+//==================================================================
+// SPRAY SYSTEM SCREEN  (page 0)
+//   The mimic view from the spec (slide 12). Merges the three old
+//   spray programs (process view + manual + live readouts) into one
+//   schematic screen:
+//     - valve states by colour: green = open, grey = closed,
+//       red = in transit (SPX by traffic-light, circulation = inverse,
+//       air by command)
+//     - piston lamps (green at a known end), mold-at-height lamp,
+//       spray marks, pump Hz, SPX level, SPX/Air pressures
+//     - manual buttons (live only in manual); mode colour
+//       yellow = manual, green = auto
+//   The sequence engine stays in MAIN; this program is the HMI face.
+//==================================================================
+VAR_OUTPUT
+    // ---- operator commands consumed by MAIN ----
+    bCmdAuto  : BOOL;    // AUTO/MANUAL toggle button (tap = pulse)
+    bCmdReset : BOOL;    // "Reset fault" button
+
+    // ---- manual mode (consumed by MAIN while idle) ----
+    bManualActive   : BOOL;   // TRUE = manual commands drive the outputs
+    bManAirValve    : BOOL;   // manual: air valve        (HMI toggle)
+    bManSPXValve    : BOOL;   // manual: SPX valve         (HMI toggle)
+    bManPistonOpen  : BOOL;   // manual: piston OPEN  sol. (HMI toggle)
+    bManPistonClose : BOOL;   // manual: piston CLOSE sol. (HMI toggle)
+    rManPumpHz      : REAL := 15.0;   // manual: gear-pump speed setpoint [Hz]
+END_VAR
+
+VAR
+    // ---- mimic colours (AARRGGBB) ----
+    cAirValve   : DWORD;
+    cSPXValve   : DWORD;
+    cCircValve  : DWORD;
+    cPistonOpen : DWORD;
+    cPistonClose: DWORD;
+    cModeColor  : DWORD;
+
+    // ---- lamps / flags ----
+    bMoldLamp   : BOOL;   // mold at spray height
+    bSprayMarks : BOOL;   // spray marks visible
+    bFault      : BOOL;
+
+    // ---- text ----
+    sStateText  : STRING;
+    sModeText   : STRING;
+    sErrorText  : STRING;
+    sWarnText   : STRING;
+
+    // ---- live readouts mirrored for the HMI ----
+    rPumpHz      : REAL;
+    rSPXLevel    : REAL;
+    rSPXPressure : REAL;
+    rAirPressure : REAL;
+
+    i : INT;
+END_VAR
+
+VAR CONSTANT
+    cGREEN  : DWORD := 16#FF46A758;   // open / auto / OK
+    cGREY   : DWORD := 16#FF8A8F98;   // closed
+    cRED    : DWORD := 16#FFE5484D;   // in transit / fault
+    cYELLOW : DWORD := 16#FFF2C94C;   // manual
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[//==================================================================
+// 1) NAV + STATE/ERROR TEXT
+//==================================================================
+FOR i := 0 TO 1 DO
+    GVL_Nav.abNavActive[i] := (GVL_Nav.nPage = i);   // 0 = Spray, 1 = Machine Parameters
+END_FOR
+
+bFault := (MAIN.eState = E_SeqState.eFault) OR (MAIN.nErrorCode > 0);
+
+CASE MAIN.eState OF
+    E_SeqState.eIdle:         sStateText := 'Idle / circulation';
+    E_SeqState.eDewater:      sStateText := 'T1 - dewater';
+    E_SeqState.eSprayOpen:    sStateText := 'Spray - opening';
+    E_SeqState.eSprayClose:   sStateText := 'Spray - closing';
+    E_SeqState.eCloseDewater: sStateText := 'T5 - dewater / close';
+ELSE
+    sStateText := 'Fault';
+END_CASE
+
+CASE MAIN.nErrorCode OF
+    0:  sErrorText := 'No fault';
+    10: sErrorText := 'Piston not at P-close';
+    20: sErrorText := 'SPX valve stuck (open)';
+    21: sErrorText := 'SPX valve stuck (close)';
+    30: sErrorText := 'Piston open timeout';
+    40: sErrorText := 'Piston close timeout';
+    99: sErrorText := 'Unknown state';
+ELSE
+    sErrorText := 'Fault';
+END_CASE
+
+// non-latching warnings (most relevant one)
+IF GVL_Process.bLevelEmpty THEN
+    sWarnText := 'SPX TANK EMPTY - pump off, mother held';
+ELSIF GVL_Process.bWarnLevelLow THEN
+    sWarnText := 'SPX level low (<20%)';
+ELSIF GVL_Process.bWarnLevelHigh THEN
+    sWarnText := 'SPX level high (>95%)';
+ELSIF GVL_Process.bWarnBadSPX THEN
+    sWarnText := 'Bad SPX pressure';
+ELSIF GVL_Process.bWarnCircPress THEN
+    sWarnText := 'Adjust circulation pressure';
+ELSE
+    sWarnText := '';
+END_IF
+
+//==================================================================
+// 2) VALVE COLOURS   green = open, grey = closed, red = in transit
+//==================================================================
+// SPX valve - by the traffic-light feedback
+IF GVL_IO.bSPXFullyOpen THEN
+    cSPXValve := cGREEN;
+ELSIF GVL_IO.bSPXFullyClose THEN
+    cSPXValve := cGREY;
+ELSE
+    cSPXValve := cRED;                 // neither end -> moving
+END_IF
+
+// Circulation valve - the inverse of SPX
+IF GVL_IO.bSPXFullyClose THEN
+    cCircValve := cGREEN;              // SPX closed  -> circulation open
+ELSIF GVL_IO.bSPXFullyOpen THEN
+    cCircValve := cGREY;              // SPX open    -> circulation closed
+ELSE
+    cCircValve := cRED;
+END_IF
+
+// Air valve - by command (solenoid, no feedback)
+IF GVL_IO.bAirValve THEN cAirValve := cGREEN; ELSE cAirValve := cGREY; END_IF
+
+//==================================================================
+// 3) PISTON LAMPS + MOLD LAMP + SPRAY MARKS
+//==================================================================
+IF GVL_IO.bPistonOpen  THEN cPistonOpen  := cGREEN; ELSE cPistonOpen  := cGREY; END_IF
+IF GVL_IO.bPistonClosed THEN cPistonClose := cGREEN; ELSE cPistonClose := cGREY; END_IF
+
+bMoldLamp := GVL_IO.bMoldAtSprayHigh;
+
+// spray marks: piston off BOTH ends AND SPX + Air valves open
+bSprayMarks := (NOT GVL_IO.bPistonOpen) AND (NOT GVL_IO.bPistonClosed)
+            AND GVL_IO.bSPXValve AND GVL_IO.bAirValve;
+
+//==================================================================
+// 4) MODE COLOUR / TEXT   manual = yellow, auto = green, fault = red
+//==================================================================
+IF bFault THEN
+    cModeColor := cRED;    sModeText := 'FAULT';
+ELSIF MAIN.bAutoMode THEN
+    cModeColor := cGREEN;  sModeText := 'AUTO';
+ELSE
+    cModeColor := cYELLOW; sModeText := 'MANUAL';
+END_IF
+
+//==================================================================
+// 5) LIVE READOUTS
+//==================================================================
+rPumpHz      := GVL_IO.rPumpHz;
+rSPXLevel    := GVL_IO.rSPXLevel;
+rSPXPressure := GVL_IO.rSPXPressure;
+rAirPressure := GVL_IO.rAirPressure;
+
+//==================================================================
+// 6) MANUAL MODE
+//   Live only when AUTO is off and the sequence is idle. Buttons
+//   toggle each actuator; MAIN applies bMan* while bManualActive.
+//==================================================================
+bManualActive := (NOT MAIN.bAutoMode) AND (MAIN.eState = E_SeqState.eIdle);
+
+IF NOT bManualActive THEN
+    bManAirValve    := FALSE;
+    bManSPXValve    := FALSE;
+    bManPistonOpen  := FALSE;
+    bManPistonClose := FALSE;
+ELSE
+    // manual pump setpoint drives the VFD directly (empty still wins)
+    IF GVL_Process.bLevelEmpty THEN
+        GVL_IO.rPumpHz := 0.0;
+    ELSE
+        GVL_IO.rPumpHz := rManPumpHz;
+    END_IF
+END_IF
+
+//==================================================================
+// 7) CONSUME COMMAND BITS
+//   MAIN read them at the top of this scan; clearing here means the
+//   HMI button only has to write TRUE once per press.
+//==================================================================
+bCmdAuto  := FALSE;
+bCmdReset := FALSE;
+]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

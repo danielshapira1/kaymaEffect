@@ -1,0 +1,291 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="MAIN" Id="{b5c3cda7-a032-4566-998a-7c5c71258437}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM MAIN
+VAR_OUTPUT
+    // ---- status (read by the HMI screens) ----
+    eState        : E_SeqState := E_SeqState.eIdle;  // current sequence state
+    nErrorCode    : INT;          // latched sequence fault (see constants)
+    bAutoMode     : BOOL;         // TRUE = AUTO armed.  FALSE at boot = MANUAL
+    bError        : BOOL;         // TRUE while in fault
+    bReadyToStart : BOOL;         // TRUE while idle in manual (AUTO can be armed)
+END_VAR
+
+VAR
+    // ---- edge detection ----
+    rtAuto  : R_TRIG;   // AUTO/STOP toggle (HW OR HMI)
+    rtReset : R_TRIG;   // fault reset      (HW OR HMI)
+
+    // ---- timers (one per spec timer) ----
+    tonDewater    : TON;   // T1 - dewater / suck slurry
+    tonSPXOpen    : TON;   // T2 - SPX-valve-open watchdog
+    tonSprayOpen  : TON;   // T3 - piston opening-stroke watchdog
+    tonSprayClose : TON;   // T4 - piston closing-stroke watchdog
+    tonSPXClose   : TON;   // T6 - SPX-valve-close watchdog
+    tonDewaterCl  : TON;   // T5 - dewater after closing
+
+    // ---- SPX pressure averaging accumulators ----
+    rSumT3   : REAL;   nCntT3   : DINT;   // opening stroke
+    rSumT4   : REAL;   nCntT4   : DINT;   // closing stroke
+    rSumCirc : REAL;   nCntCirc : DINT;   // circulation (handshake down)
+END_VAR
+
+VAR CONSTANT
+    // ---- latched fault codes ----
+    nERR_NONE            : INT := 0;
+    nERR_PISTON_NOT_HOME : INT := 10;   // start: piston not at P-close
+    nERR_SPX_OPEN_STUCK  : INT := 20;   // T2: SPX valve never reported Fully Open
+    nERR_SPX_CLOSE_STUCK : INT := 21;   // T6: SPX valve never reported Fully Close
+    nERR_PISTON_OPEN_TO  : INT := 30;   // T3: piston did not reach P-open in time
+    nERR_PISTON_CLOSE_TO : INT := 40;   // T4: piston did not reach P-close in time
+    nERR_UNKNOWN_STATE   : INT := 99;   // illegal eState
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[//==================================================================
+// MAIN - spray sequence + scheduling   (aligned to the Alfa/Brazil spec)
+//
+// Flow (AUTO):  mother raises 'Spray feasible' -> we take control, move
+// the mold to spray height, run ONE spray cycle (T1..T6), then lower
+// 'busy' so the mother resumes. The cycle is handshake-gated, not free-
+// running: each casting cycle the mother hands us control exactly once.
+//==================================================================
+SIM_Plant();    // drives GVL_IO inputs; set SIM_Plant.bSimEnable:=FALSE for real HW
+
+// Edge detectors (HW inputs OR-ed with the HMI buttons from PRG_Spray).
+rtAuto (CLK := GVL_IO.bAutoToggleHW OR PRG_Spray.bCmdAuto);
+rtReset(CLK := GVL_IO.bResetHW      OR PRG_Spray.bCmdReset);
+
+// The circulation valve is ALWAYS the inverse of the SPX valve.
+GVL_IO.bCircValve := NOT GVL_IO.bSPXValve;
+
+// ---- AUTO / MANUAL toggle ----
+//   press once  -> arm AUTO
+//   AUTO -> MANUAL -> STOP NOW: abort to S0/idle on THIS scan. Because
+//   this runs before the CASE, the eIdle branch below drops every
+//   actuator the same scan - the running cycle stops immediately.
+IF rtAuto.Q THEN
+    IF bAutoMode THEN
+        bAutoMode := FALSE;                 // AUTO -> MANUAL
+        eState    := E_SeqState.eIdle;      // abort to S0 immediately (outputs drop in eIdle)
+    ELSIF NOT bError THEN
+        bAutoMode := TRUE;                  // arm AUTO
+    END_IF
+END_IF
+
+CASE eState OF
+
+    //--------------------------------------------------------------
+    // S0 - IDLE / MANUAL   (circulation running, mother free)
+    //--------------------------------------------------------------
+    E_SeqState.eIdle:
+        GVL_IO.bAirValve        := FALSE;
+        GVL_IO.bSPXValve        := FALSE;     // -> circulation valve open
+        GVL_IO.bPistonCloseSol  := TRUE;      // default: hold the piston closed
+        GVL_IO.bPistonOpenSol   := FALSE;
+        GVL_IO.bGoToCleaningPos := FALSE;
+        GVL_IO.bSprayBusy       := FALSE;     // mother is free to move
+        bError        := FALSE;
+        bReadyToStart := NOT bAutoMode;
+        nErrorCode    := nERR_NONE;
+
+        // reset all timers + stroke accumulators (clean start next cycle)
+        tonDewater(IN := FALSE);   tonSPXOpen(IN := FALSE);   tonSprayOpen(IN := FALSE);
+        tonSprayClose(IN := FALSE); tonSPXClose(IN := FALSE); tonDewaterCl(IN := FALSE);
+        rSumT3 := 0; nCntT3 := 0; rSumT4 := 0; nCntT4 := 0;
+
+        // average SPX pressure during circulation (handshake down)
+        rSumCirc := rSumCirc + GVL_IO.rSPXPressure;
+        nCntCirc := nCntCirc + 1;
+        IF nCntCirc > 0 THEN
+            GVL_Process.rSPXAvgCirc := rSumCirc / DINT_TO_REAL(nCntCirc);
+        END_IF
+
+        IF bAutoMode THEN
+            // Start a cycle only when the mother hands control over
+            // (bSprayFeasible), the piston is home, and the tank isn't empty.
+            IF GVL_IO.bSprayFeasible AND GVL_IO.bPistonClosed AND NOT GVL_Process.bLevelEmpty THEN
+                GVL_IO.bSprayBusy       := TRUE;   // tell the mother we are running
+                GVL_IO.bGoToCleaningPos := TRUE;   // ask the mother to move the mold up
+                GVL_Process.bWarnBadSPX := FALSE;  // fresh cycle
+                rSumCirc := 0; nCntCirc := 0;      // restart circulation average
+                bReadyToStart := FALSE;
+                eState := E_SeqState.eDewater;
+            END_IF
+        ELSIF PRG_Spray.bManualActive THEN
+            // MANUAL: operator drives the actuators directly.
+            GVL_IO.bAirValve       := PRG_Spray.bManAirValve;
+            GVL_IO.bSPXValve       := PRG_Spray.bManSPXValve;
+            GVL_IO.bPistonOpenSol  := PRG_Spray.bManPistonOpen;
+            GVL_IO.bPistonCloseSol := PRG_Spray.bManPistonClose;
+        END_IF
+
+    //--------------------------------------------------------------
+    // S1 - DEWATER (T1)   + position the mold to spray height
+    //--------------------------------------------------------------
+    E_SeqState.eDewater:
+        GVL_IO.bAirValve       := FALSE;
+        GVL_IO.bSPXValve       := FALSE;
+        GVL_IO.bPistonCloseSol := TRUE;       // keep piston closed
+        GVL_IO.bPistonOpenSol  := FALSE;
+
+        // keep asking until the mold reports it is at spray height
+        GVL_IO.bGoToCleaningPos := NOT GVL_IO.bMoldAtSprayHigh;
+
+        tonDewater(IN := TRUE, PT := GVL_Param.tDewaterTime);
+
+        // advance once T1 elapsed AND the mold is in position
+        IF tonDewater.Q AND GVL_IO.bMoldAtSprayHigh THEN
+            eState := E_SeqState.eSprayOpen;
+        END_IF
+
+    //--------------------------------------------------------------
+    // S2 - SPRAY, OPENING   (open valves; piston travels P-close->P-open)
+    //   T2 watchdog: SPX valve must reach Fully Open.
+    //   T3 watchdog: piston must complete the opening stroke.
+    //   Average SPX pressure over the stroke -> "...average at T3".
+    //--------------------------------------------------------------
+    E_SeqState.eSprayOpen:
+        GVL_IO.bAirValve       := TRUE;
+        GVL_IO.bSPXValve       := TRUE;       // -> circulation valve closes
+        GVL_IO.bPistonOpenSol  := TRUE;       // drive piston OPEN
+        GVL_IO.bPistonCloseSol := FALSE;
+
+        // T2 - SPX-valve-open confirmation watchdog (runs until Fully Open)
+        tonSPXOpen(IN := NOT GVL_IO.bSPXFullyOpen, PT := GVL_Param.tSPXMaxOpenTime);
+        IF tonSPXOpen.Q THEN
+            nErrorCode := nERR_SPX_OPEN_STUCK;
+            eState     := E_SeqState.eFault;
+        END_IF
+
+        // T3 - opening-stroke watchdog (starts once the piston leaves P-close)
+        tonSprayOpen(IN := NOT GVL_IO.bPistonClosed, PT := GVL_Param.tSprayOpenTime);
+        IF tonSprayOpen.Q AND NOT GVL_IO.bPistonOpen THEN
+            nErrorCode := nERR_PISTON_OPEN_TO;
+            eState     := E_SeqState.eFault;
+        END_IF
+
+        // running SPX pressure average over the opening stroke
+        rSumT3 := rSumT3 + GVL_IO.rSPXPressure;
+        nCntT3 := nCntT3 + 1;
+
+        // stroke finished -> store average, check pressure, go to closing
+        IF GVL_IO.bPistonOpen THEN
+            IF nCntT3 > 0 THEN
+                GVL_Process.rSPXAvgT3 := rSumT3 / DINT_TO_REAL(nCntT3);
+            END_IF
+            IF ABS(GVL_Process.rSPXAvgT3 - GVL_Param.rSPXPressureTarget) >= GVL_Param.rSPXPressTol THEN
+                GVL_Process.bWarnBadSPX := TRUE;
+            END_IF
+            eState := E_SeqState.eSprayClose;
+        END_IF
+
+    //--------------------------------------------------------------
+    // S3 - SPRAY, CLOSING   (piston travels P-open->P-close)
+    //   T4 watchdog: piston must complete the closing stroke.
+    //   Average SPX pressure over the stroke -> "...average at T4".
+    //--------------------------------------------------------------
+    E_SeqState.eSprayClose:
+        GVL_IO.bAirValve       := TRUE;
+        GVL_IO.bSPXValve       := TRUE;
+        GVL_IO.bPistonOpenSol  := FALSE;
+        GVL_IO.bPistonCloseSol := TRUE;       // drive piston CLOSE
+
+        // T4 - closing-stroke watchdog (starts once the piston leaves P-open)
+        tonSprayClose(IN := NOT GVL_IO.bPistonOpen, PT := GVL_Param.tSprayCloseTime);
+        IF tonSprayClose.Q AND NOT GVL_IO.bPistonClosed THEN
+            nErrorCode := nERR_PISTON_CLOSE_TO;
+            eState     := E_SeqState.eFault;
+        END_IF
+
+        rSumT4 := rSumT4 + GVL_IO.rSPXPressure;
+        nCntT4 := nCntT4 + 1;
+
+        IF GVL_IO.bPistonClosed THEN
+            IF nCntT4 > 0 THEN
+                GVL_Process.rSPXAvgT4 := rSumT4 / DINT_TO_REAL(nCntT4);
+            END_IF
+            IF ABS(GVL_Process.rSPXAvgT4 - GVL_Param.rSPXPressureTarget) >= GVL_Param.rSPXPressTol THEN
+                GVL_Process.bWarnBadSPX := TRUE;
+            END_IF
+            eState := E_SeqState.eCloseDewater;
+        END_IF
+
+    //--------------------------------------------------------------
+    // S4 - CLOSE + DEWATER   (T6 valve-close watchdog + T5 dewater)
+    //   On T5 end: lower 'busy' -> the mother resumes.
+    //--------------------------------------------------------------
+    E_SeqState.eCloseDewater:
+        GVL_IO.bAirValve       := FALSE;
+        GVL_IO.bSPXValve       := FALSE;      // -> circulation valve opens again
+        GVL_IO.bPistonOpenSol  := FALSE;
+        GVL_IO.bPistonCloseSol := TRUE;       // hold piston closed
+
+        // T6 - SPX-valve-close confirmation watchdog (runs until Fully Close)
+        tonSPXClose(IN := NOT GVL_IO.bSPXFullyClose, PT := GVL_Param.tSPXMaxCloseTime);
+        IF tonSPXClose.Q THEN
+            nErrorCode := nERR_SPX_CLOSE_STUCK;
+            eState     := E_SeqState.eFault;
+        END_IF
+
+        // T5 - dewater
+        tonDewaterCl(IN := TRUE, PT := GVL_Param.tSPXDewaterTime);
+        IF tonDewaterCl.Q THEN
+            // tank-empty lockout: do NOT release the mother while empty
+            IF NOT GVL_Process.bLevelEmpty THEN
+                GVL_IO.bSprayBusy := FALSE;          // lower the flag -> mother resumes
+                eState            := E_SeqState.eIdle;
+            END_IF
+        END_IF
+
+    //--------------------------------------------------------------
+    // FAULT - latched until reset.
+    //   The actuators are forced safe by the SAFE-STATE OVERLAY right
+    //   after this CASE, so a fault raised mid-cycle drops every output
+    //   on the SAME scan (the spray states energise their outputs at the
+    //   top of their branch, then test for faults).
+    //--------------------------------------------------------------
+    E_SeqState.eFault:
+        IF rtReset.Q THEN
+            bError     := FALSE;
+            nErrorCode := nERR_NONE;
+            eState     := E_SeqState.eIdle;
+        END_IF
+
+ELSE
+    nErrorCode := nERR_UNKNOWN_STATE;
+    eState     := E_SeqState.eFault;
+END_CASE
+
+//==================================================================
+// SAFE-STATE OVERLAY - runs every scan, right after the sequencer.
+//   A fault must stop the process RIGHT AWAY. The spray states set
+//   their outputs TRUE at the top of the branch and only then test for
+//   faults, so without this the actuators would drop one scan late. On
+//   the scan a fault is raised, eState is already eFault here, so every
+//   output drops in the same scan and AUTO is dropped to MANUAL.
+//   (The AUTO->MANUAL abort lands in eIdle above, which is safe the
+//    same scan, so it needs no overlay.)
+//==================================================================
+IF eState = E_SeqState.eFault THEN
+    GVL_IO.bAirValve        := FALSE;
+    GVL_IO.bSPXValve        := FALSE;
+    GVL_IO.bPistonOpenSol   := FALSE;
+    GVL_IO.bPistonCloseSol  := TRUE;     // hold the piston closed
+    GVL_IO.bGoToCleaningPos := FALSE;
+    GVL_IO.bSprayBusy       := FALSE;    // hand control back to the mother
+    bError        := TRUE;
+    bReadyToStart := FALSE;
+    bAutoMode     := FALSE;              // a fault always drops AUTO -> MANUAL
+END_IF
+
+//==================================================================
+// Supervision + screen programs (all run every scan)
+//==================================================================
+PRG_Process();   // level monitoring, pump P-control, circulation check
+PRG_Spray();     // Spray System screen      (page 0)
+PRG_Params();    // Machine Parameters screen (page 1)
+]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>
