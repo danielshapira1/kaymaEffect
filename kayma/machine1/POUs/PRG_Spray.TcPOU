@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
   <POU Name="PRG_Spray" Id="{7e3a9c14-5b62-4d08-9f1a-2c6e8b4d3a05}" SpecialFunc="None">
     <Declaration><![CDATA[PROGRAM PRG_Spray
@@ -38,6 +38,7 @@ VAR
     cPistonOpen : DWORD;
     cPistonClose: DWORD;
     cModeColor  : DWORD;
+	cErrorColor : DWORD;   // error-line text colour: red fault / yellow warn / grey ok
 
     // ---- lamps / flags ----
     bMoldLamp   : BOOL;   // mold at spray height
@@ -93,10 +94,25 @@ CASE MAIN.nErrorCode OF
     21: sErrorText := 'SPX valve stuck (close)';
     30: sErrorText := 'Piston open timeout';
     40: sErrorText := 'Piston close timeout';
+	50: sErrorText := 'SPX level high (>95%)';
+	51: sErrorText := 'SPX level low (<5%)';
     99: sErrorText := 'Unknown state';
 ELSE
     sErrorText := 'Fault';
 END_CASE
+
+// error-line colour + level-warning overlay (warnings only show when no latched fault)
+IF bFault THEN
+    cErrorColor := cRED;
+ELSIF GVL_Process.bLevelEmpty THEN
+    cErrorColor := cYELLOW;
+    sErrorText  := 'Warn: SPX tank empty - pump stopped';
+ELSIF GVL_Process.bWarnLevelLow THEN
+    cErrorColor := cYELLOW;
+    sErrorText  := 'Warn: low SPX level';
+ELSE
+    cErrorColor := cGREY;
+END_IF
 
 // non-latching warnings (most relevant one)
 IF GVL_Process.bLevelEmpty THEN

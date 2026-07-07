@@ -38,6 +38,8 @@ VAR CONSTANT
     nERR_SPX_CLOSE_STUCK : INT := 21;   // T6: SPX valve never reported Fully Close
     nERR_PISTON_OPEN_TO  : INT := 30;   // T3: piston did not reach P-open in time
     nERR_PISTON_CLOSE_TO : INT := 40;   // T4: piston did not reach P-close in time
+	nERR_LEVEL_HIGH : INT := 50;   // SPX level above rLevelHigh (>95%)
+	nERR_LEVEL_LOW  : INT := 51;   // SPX level below rLevelEmpty (<5%)
     nERR_UNKNOWN_STATE   : INT := 99;   // illegal eState
 END_VAR
 ]]></Declaration>
@@ -51,6 +53,11 @@ END_VAR
 // running: each casting cycle the mother hands us control exactly once.
 //==================================================================
 SIM_Plant();    // drives GVL_IO inputs; set SIM_Plant.bSimEnable:=FALSE for real HW
+
+// Scale EL3054 raw (0..32767 = 4..20 mA) -> SPX tank level [%]
+IF NOT SIM_Plant.bSimLevelActive THEN
+GVL_IO.rSPXLevel := INT_TO_REAL(GVL_IO.iSPXLevelRaw) * (100.0 / 32767.0);
+END_IF;
 
 // Edge detectors (HW inputs OR-ed with the HMI buttons from PRG_Spray).
 rtAuto (CLK := GVL_IO.bAutoToggleHW OR PRG_Spray.bCmdAuto);
@@ -258,6 +265,21 @@ ELSE
 END_CASE
 
 //==================================================================
+// SPX LEVEL FAULT - out-of-band level raises a latched fault.
+//   AUTO only: in MANUAL the operator may work freely (warnings and
+//   the pump dry-run stop still apply, but nothing latches).
+//==================================================================
+IF (eState <> E_SeqState.eFault) AND bAutoMode THEN
+    IF GVL_IO.rSPXLevel > GVL_Param.rLevelHigh THEN
+        nErrorCode := nERR_LEVEL_HIGH;
+        eState     := E_SeqState.eFault;
+    ELSIF GVL_IO.rSPXLevel < GVL_Param.rLevelEmpty THEN
+        nErrorCode := nERR_LEVEL_LOW;
+        eState     := E_SeqState.eFault;
+    END_IF
+END_IF
+
+//==================================================================
 // SAFE-STATE OVERLAY - runs every scan, right after the sequencer.
 //   A fault must stop the process RIGHT AWAY. The spray states set
 //   their outputs TRUE at the top of the branch and only then test for
@@ -285,6 +307,7 @@ END_IF
 PRG_Process();   // level monitoring, pump P-control, circulation check
 PRG_Spray();     // Spray System screen      (page 0)
 PRG_Params();    // Machine Parameters screen (page 1)
+PRG_FileLogger(); // Logger for the machine
 ]]></ST>
     </Implementation>
   </POU>

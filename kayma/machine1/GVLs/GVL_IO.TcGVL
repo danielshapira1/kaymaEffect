@@ -26,12 +26,13 @@ VAR_GLOBAL
     bResetHW         : BOOL;   // HW fault reset                    // AT %I*
 
     // ============ ANALOG INPUTS (4-20 mA, scaled to engineering units) ============
+	iSPXLevelRaw  AT %I* : INT; 
     rSPXLevel        : REAL;   // SPX tank level  [%]               // AT %I* (scaled)
     rSPXPressure     : REAL;   // SPX pressure    [bar]             // AT %I* (scaled)
     rAirPressure     : REAL;   // Air pressure    [bar]             // AT %I* (scaled)
 
     // ============ DIGITAL OUTPUTS (0-24 V) ============
-    bAirValve        : BOOL;   // air valve solenoid                // AT %Q*
+    bAirValve  AT %Q*      : BOOL;   // air valve solenoid                // AT %Q*
     bSPXValve        : BOOL;   // SPX valve - command OPEN          // AT %Q*
     bCircValve       : BOOL;   // circulation valve = NOT bSPXValve // AT %Q*
     bPistonOpenSol   : BOOL;   // piston OPEN  solenoid (or mother cmd)  // AT %Q*

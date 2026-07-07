@@ -51,6 +51,11 @@
               <l n="LanguageTexts" t="ArrayList" />
             </o>
             <o>
+              <v n="TextID">"709"</v>
+              <v n="TextDefault">"clean mode"</v>
+              <l n="LanguageTexts" t="ArrayList" />
+            </o>
+            <o>
               <v n="TextID">"117"</v>
               <v n="TextDefault">"close"</v>
               <l n="LanguageTexts" t="ArrayList" />
@@ -153,6 +158,11 @@
             <o>
               <v n="TextID">"919"</v>
               <v n="TextDefault">"S"</v>
+              <l n="LanguageTexts" t="ArrayList" />
+            </o>
+            <o>
+              <v n="TextID">"518"</v>
+              <v n="TextDefault">"sim/real value"</v>
               <l n="LanguageTexts" t="ArrayList" />
             </o>
             <o>

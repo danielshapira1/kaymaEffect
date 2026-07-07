@@ -12,6 +12,13 @@ VAR
     bSimEnable       : BOOL := TRUE;     // master enable
     bSimAutoStart    : BOOL := FALSE;    // TRUE = kick the machine into AUTO once (demo).
                                          // Default FALSE: boots in MANUAL, as specified.
+	bSimLevelActive : BOOL := TRUE;   // TRUE = simulate, FALSE = real sensor
+    fSimLevel       : REAL := 20.0;   // simulated level [%]
+    fSimRate        : REAL := 5.0;    // rate of change [% per second]
+    bSimUp          : BOOL := TRUE;   // TRUE = filling, FALSE = draining
+	bAutoKicked 	: BOOL;
+    tLast           : TIME;
+    fDt             : REAL;
 
     // ---- simulated mechanical times (must stay < the matching watchdog) ----
     tSimPistonStroke : TIME := T#2S;     // piston travel  (< T3 / T4 = 3 s)
@@ -27,7 +34,7 @@ VAR
     tonMold    : TON;
     tonStart   : TON;
     rtStartGap : R_TRIG;
-    bAutoKicked : BOOL;
+    
 END_VAR
 ]]></Declaration>
     <Implementation>
@@ -82,7 +89,6 @@ GVL_IO.bMoldAtSprayHigh := tonMold.Q;
 // Analog inputs.  Level mid-range (no level warnings); SPX pressure
 // eases toward ~1.72 bar while spraying (within tolerance of 1.70).
 //------------------------------------------------------------------
-GVL_IO.rSPXLevel := 60.0;
 
 IF GVL_IO.bSPXValve THEN
     GVL_IO.rSPXPressure := GVL_IO.rSPXPressure + (1.72 - GVL_IO.rSPXPressure) * 0.3;
@@ -107,6 +113,31 @@ rtStartGap(CLK := tonStart.Q);
 GVL_IO.bAutoToggleHW := rtStartGap.Q;
 IF rtStartGap.Q THEN
     bAutoKicked := TRUE;
+END_IF
+
+fDt   := TIME_TO_REAL(TIME() - tLast) / 1000.0;
+tLast := TIME();
+fDt   := LIMIT(0.0, fDt, 0.1);   // guard against the first-cycle jump
+
+IF bSimLevelActive THEN
+    IF bSimUp THEN
+        fSimLevel := fSimLevel + fSimRate * fDt;
+        IF fSimLevel >= 90.0 THEN
+            fSimLevel := 90.0;
+            bSimUp    := FALSE;      // top reached -> drain
+        END_IF
+    ELSE
+        fSimLevel := fSimLevel - fSimRate * fDt;
+        IF fSimLevel <= 12.0 THEN
+            fSimLevel := 12.0;
+            bSimUp    := TRUE;       // bottom reached -> fill
+        END_IF
+    END_IF
+    GVL_IO.rSPXLevel := fSimLevel;
+END_IF
+
+IF NOT bSimLevelActive THEN
+    GVL_IO.rSPXLevel := INT_TO_REAL(GVL_IO.iSPXLevelRaw) * 100.0 / 32767.0;
 END_IF
 ]]></ST>
     </Implementation>

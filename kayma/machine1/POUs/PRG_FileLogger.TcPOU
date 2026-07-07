@@ -1,0 +1,127 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="PRG_FileLogger" Id="{48347e3b-6f89-4567-98bc-defbbc795fef}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM PRG_FileLogger
+VAR
+	// ---- config ----
+    sFileName  : STRING(255) := 'spx_level_low.log';  // in the TwinCAT Boot folder (see ePath below)
+    tCooldown  : TIME := T#60S;   // min. spacing between logged events (guards against
+                                  // chatter if the level hovers right at the threshold)
+
+    // ---- event detection ----
+    rtLow      : R_TRIG;          // rising edge of the warning
+    tonCool    : TON;
+    bCool      : BOOL;
+
+    // ---- timestamp ----
+    fbTime     : FB_LocalSystemTime := (bEnable := TRUE, dwCycle := 1);
+
+    // ---- file access (Tc2_System) ----
+    fbOpen     : FB_FileOpen;
+    fbWrite    : FB_FileWrite;
+    fbClose    : FB_FileClose;
+    hFile      : UINT;
+    eStep      : (IDLE, OPEN_FILE, WRITE_LINE, CLOSE_FILE);
+
+    // ---- line buffers ----
+    sNew       : STRING(255);
+    sLine      : STRING(255);     // line currently being written
+    sPending   : STRING(255);     // one-slot queue if an event lands mid-write
+
+    // ---- diagnostics (watch these online if nothing appears in the file) ----
+    nLastErrId : UDINT;           // last ADS error id from open/write
+    nFailCount : UINT;            // events lost to file errors
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// ---- time base (cyclic) ----
+fbTime();
+
+// ---- edge detection + cooldown ----
+rtLow(CLK := GVL_Process.bWarnLevelLow);
+
+tonCool(IN := bCool, PT := tCooldown);
+IF tonCool.Q THEN
+    bCool := FALSE;
+END_IF
+
+IF rtLow.Q AND NOT bCool AND fbTime.bValid THEN
+    bCool := TRUE;
+
+    // Build the line NOW, so the timestamp and level are from the moment
+    // of the event, not from when the file write happens to finish.
+    sNew := SYSTEMTIME_TO_STRING(fbTime.systemTime);
+    sNew := CONCAT(sNew, '  WARN  SPX level low: ');
+    sNew := CONCAT(sNew, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_IO.rSPXLevel), 1, TRUE));
+    sNew := CONCAT(sNew, ' %  (limit ');
+    sNew := CONCAT(sNew, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Param.rLevelLow), 1, TRUE));
+    sNew := CONCAT(sNew, ' %)$N');
+
+    IF eStep = IDLE THEN
+        sLine := sNew;
+        eStep := OPEN_FILE;
+    ELSE
+        sPending := sNew;         // extremely unlikely at this rate, but safe
+    END_IF
+END_IF
+
+// ---- file state machine: open (append) -> write -> close ----
+CASE eStep OF
+
+    IDLE:
+        IF sPending <> '' THEN    // a line queued up while we were busy
+            sLine    := sPending;
+            sPending := '';
+            eStep    := OPEN_FILE;
+        END_IF
+
+    OPEN_FILE:
+        fbOpen(sNetId    := '',
+               sPathName := sFileName,
+               nMode     := FOPEN_MODEAPPEND OR FOPEN_MODETEXT,
+               ePath     := PATH_BOOTPATH,
+               tTimeout  := T#3S,
+               bExecute  := TRUE);
+        IF NOT fbOpen.bBusy THEN
+            fbOpen(bExecute := FALSE);
+            IF fbOpen.bError THEN
+                nLastErrId := fbOpen.nErrId;
+                nFailCount := nFailCount + 1;
+                eStep := IDLE;    // drop this line, never block the machine
+            ELSE
+                hFile := fbOpen.hFile;
+                eStep := WRITE_LINE;
+            END_IF
+        END_IF
+
+    WRITE_LINE:
+        fbWrite(sNetId     := '',
+                hFile      := hFile,
+                pWriteBuff := ADR(sLine),
+                cbWriteLen := TO_UDINT(LEN(sLine)),
+                tTimeout   := T#3S,
+                bExecute   := TRUE);
+        IF NOT fbWrite.bBusy THEN
+            fbWrite(bExecute := FALSE);
+            IF fbWrite.bError THEN
+                nLastErrId := fbWrite.nErrId;
+                nFailCount := nFailCount + 1;
+            END_IF
+            eStep := CLOSE_FILE;  // always close, even after a write error
+        END_IF
+
+    CLOSE_FILE:
+        fbClose(sNetId   := '',
+                hFile    := hFile,
+                tTimeout := T#3S,
+                bExecute := TRUE);
+        IF NOT fbClose.bBusy THEN
+            fbClose(bExecute := FALSE);
+            hFile := 0;
+            eStep := IDLE;
+        END_IF
+
+END_CASE]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>
