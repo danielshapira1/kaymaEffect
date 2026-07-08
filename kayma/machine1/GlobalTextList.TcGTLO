@@ -26,6 +26,11 @@
               <l n="LanguageTexts" t="ArrayList" />
             </o>
             <o>
+              <v n="TextID">"399"</v>
+              <v n="TextDefault">"Add Water"</v>
+              <l n="LanguageTexts" t="ArrayList" />
+            </o>
+            <o>
               <v n="TextID">"603"</v>
               <v n="TextDefault">"air valve"</v>
               <l n="LanguageTexts" t="ArrayList" />
@@ -58,6 +63,11 @@
             <o>
               <v n="TextID">"117"</v>
               <v n="TextDefault">"close"</v>
+              <l n="LanguageTexts" t="ArrayList" />
+            </o>
+            <o>
+              <v n="TextID">"141"</v>
+              <v n="TextDefault">"Close Drain"</v>
               <l n="LanguageTexts" t="ArrayList" />
             </o>
             <o>
@@ -183,6 +193,11 @@
             <o>
               <v n="TextID">"488"</v>
               <v n="TextDefault">"SPX valve"</v>
+              <l n="LanguageTexts" t="ArrayList" />
+            </o>
+            <o>
+              <v n="TextID">"495"</v>
+              <v n="TextDefault">"Start Clean"</v>
               <l n="LanguageTexts" t="ArrayList" />
             </o>
             <o>

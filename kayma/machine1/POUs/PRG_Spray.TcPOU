@@ -14,6 +14,9 @@
 //       spray marks, pump Hz, SPX level, SPX/Air pressures
 //     - manual buttons (live only in manual); mode colour
 //       yellow = manual, green = auto
+//     - CLEAN MODE (manual only): drain tank -> close drain / add
+//       water prompts -> refill to 20% -> 20 s delay -> auto-open
+//       the SPX valve to flush the pipes (section 6b)
 //   The sequence engine stays in MAIN; this program is the HMI face.
 //==================================================================
 VAR_OUTPUT
@@ -28,6 +31,12 @@ VAR_OUTPUT
     bManPistonOpen  : BOOL;   // manual: piston OPEN  sol. (HMI toggle)
     bManPistonClose : BOOL;   // manual: piston CLOSE sol. (HMI toggle)
     rManPumpHz      : REAL := 15.0;   // manual: gear-pump speed setpoint [Hz]
+
+    // ---- clean mode (read by MAIN) ----
+    bCleanActive    : BOOL;   // TRUE = clean sequence running: MAIN skips the
+                              // level-LOW fault and refuses to arm AUTO
+    bPostCleanEmpty : BOOL;   // TRUE = clean ended with a dry tank: keep the
+                              // level-LOW fault suppressed until refilled >5%
 END_VAR
 
 VAR
@@ -38,7 +47,6 @@ VAR
     cPistonOpen : DWORD;
     cPistonClose: DWORD;
     cModeColor  : DWORD;
-	cErrorColor : DWORD;   // error-line text colour: red fault / yellow warn / grey ok
 
     // ---- lamps / flags ----
     bMoldLamp   : BOOL;   // mold at spray height
@@ -57,6 +65,27 @@ VAR
     rSPXPressure : REAL;
     rAirPressure : REAL;
 
+    // ---- clean mode: HMI buttons (Toggle inputs; consumed in section 7) ----
+    bBtnClean      : BOOL;   // 'CLEAN MODE' / 'STOP CLEAN' button
+    bBtnStartClean : BOOL;   // 'Start Clean' button
+    bBtnCloseDrain : BOOL;   // 'Close Drain' acknowledge button
+    bBtnAddWater   : BOOL;   // 'Add Water'  acknowledge button
+
+    // ---- clean mode: state + HMI feedback ----
+    nCleanStep     : INT;    // nCLEAN_* constants below
+    bDrainAck      : BOOL;   // operator confirmed the drain is closed
+    bWaterAck      : BOOL;   // operator confirmed water is being added
+    bDrainFlash    : BOOL;   // bind to 'Close Drain' toggle-colour -> flashes
+    bWaterFlash    : BOOL;   // bind to 'Add Water'  toggle-colour -> flashes
+    sCleanBtnText  : STRING := 'CLEAN MODE';  // 'CLEAN MODE' <-> 'STOP CLEAN'
+    sCleanStatus   : STRING; // one-line operator guidance + countdown
+    nFlushSecsLeft : INT;    // countdown [s] before the SPX valve auto-opens
+
+    tonFlush       : TON;    // delay before the flush (tFLUSH_DELAY)
+    tonBlink       : TON;    // 0.5 s blink generator for the flashing buttons
+    bBlinkPhase    : BOOL;
+    bCleanPrev     : BOOL;   // clean-active on the previous scan (exit edge)
+
     i : INT;
 END_VAR
 
@@ -65,8 +94,20 @@ VAR CONSTANT
     cGREY   : DWORD := 16#FF8A8F98;   // closed
     cRED    : DWORD := 16#FFE5484D;   // in transit / fault
     cYELLOW : DWORD := 16#FFF2C94C;   // manual
-END_VAR
-]]></Declaration>
+
+    // ---- clean-mode steps ----
+    nCLEAN_OFF       : INT := 0;   // clean mode not active
+    nCLEAN_READY     : INT := 1;   // entered clean; waiting for Start Clean
+    nCLEAN_DRAIN     : INT := 2;   // pump runs until the tank reads ~0 %
+    nCLEAN_ACK       : INT := 3;   // pump off; Close Drain + Add Water flash
+    nCLEAN_REFILL    : INT := 4;   // acks done; wait level >= 20 % + Start Clean
+    nCLEAN_FLUSHWAIT : INT := 5;   // 20 s countdown, then SPX auto-opens
+    nCLEAN_FLUSH     : INT := 6;   // SPX open, pump flushes the pipes
+
+    rCLEAN_EMPTY : REAL := 0.5;    // 'tank is 0' threshold [%]
+    rCLEAN_FILL  : REAL := 20.0;   // refill minimum [%] - flush allowed at or above this
+    tFLUSH_DELAY : TIME := T#20S;  // wait before the SPX valve auto-opens
+END_VAR]]></Declaration>
     <Implementation>
       <ST><![CDATA[//==================================================================
 // 1) NAV + STATE/ERROR TEXT
@@ -100,19 +141,6 @@ CASE MAIN.nErrorCode OF
 ELSE
     sErrorText := 'Fault';
 END_CASE
-
-// error-line colour + level-warning overlay (warnings only show when no latched fault)
-IF bFault THEN
-    cErrorColor := cRED;
-ELSIF GVL_Process.bLevelEmpty THEN
-    cErrorColor := cYELLOW;
-    sErrorText  := 'Warn: SPX tank empty - pump stopped';
-ELSIF GVL_Process.bWarnLevelLow THEN
-    cErrorColor := cYELLOW;
-    sErrorText  := 'Warn: low SPX level';
-ELSE
-    cErrorColor := cGREY;
-END_IF
 
 // non-latching warnings (most relevant one)
 IF GVL_Process.bLevelEmpty THEN
@@ -188,6 +216,7 @@ rAirPressure := GVL_IO.rAirPressure;
 // 6) MANUAL MODE
 //   Live only when AUTO is off and the sequence is idle. Buttons
 //   toggle each actuator; MAIN applies bMan* while bManualActive.
+//   While CLEAN MODE runs, the clean sequence (6b) owns the pump.
 //==================================================================
 bManualActive := (NOT MAIN.bAutoMode) AND (MAIN.eState = E_SeqState.eIdle);
 
@@ -196,7 +225,7 @@ IF NOT bManualActive THEN
     bManSPXValve    := FALSE;
     bManPistonOpen  := FALSE;
     bManPistonClose := FALSE;
-ELSE
+ELSIF nCleanStep = nCLEAN_OFF THEN
     // manual pump setpoint drives the VFD directly (empty still wins)
     IF GVL_Process.bLevelEmpty THEN
         GVL_IO.rPumpHz := 0.0;
@@ -206,13 +235,171 @@ ELSE
 END_IF
 
 //==================================================================
+// 6b) CLEAN MODE   (manual only - button hidden otherwise)
+//   READY:     operator opens the drain, presses Start Clean
+//   DRAIN:     pump runs (empty lockout bypassed) until level ~0 %
+//   ACK:       pump off; 'Close Drain' + 'Add Water' flash until
+//              the operator presses each one
+//   REFILL:    operator fills the tank to 20 % or more and closes
+//              the fill valve; Start Clean accepted at level >= 20 %
+//   FLUSHWAIT: 20 s countdown shown on the HMI...
+//   FLUSH:     ...then the SPX valve is opened automatically (same
+//              path as the manual SPX button) and the pump flushes
+//              the spray pipes; when the tank runs dry the flush
+//              stops and clean mode EXITS by itself
+//   STOP CLEAN at any time stops everything and leaves clean mode.
+//   NOTE: this runs AFTER PRG_Process in the task, so its rPumpHz
+//   writes win the scan (same mechanism as the manual pump above).
+//==================================================================
+// ---- enter / stop ----
+IF bBtnClean THEN
+    IF nCleanStep = nCLEAN_OFF THEN
+        IF bManualActive THEN
+            nCleanStep := nCLEAN_READY;
+            bDrainAck  := FALSE;
+            bWaterAck  := FALSE;
+        END_IF
+    ELSE
+        // STOP CLEAN - stop whatever the sequence is doing
+        nCleanStep     := nCLEAN_OFF;
+        bManSPXValve   := FALSE;     // close the SPX valve if flushing
+        GVL_IO.rPumpHz := 0.0;       // normal manual logic resumes next scan
+    END_IF
+END_IF
+
+// leaving manual (fault / sequence running) aborts clean mode
+IF (nCleanStep <> nCLEAN_OFF) AND NOT bManualActive THEN
+    nCleanStep     := nCLEAN_OFF;
+    GVL_IO.rPumpHz := 0.0;
+END_IF
+
+bCleanActive := (nCleanStep <> nCLEAN_OFF);
+
+// 0.5 s blink generator for the flashing prompt buttons
+tonBlink(IN := NOT tonBlink.Q, PT := T#500MS);
+IF tonBlink.Q THEN
+    bBlinkPhase := NOT bBlinkPhase;
+END_IF
+
+CASE nCleanStep OF
+
+    nCLEAN_OFF:
+        tonFlush(IN := FALSE);
+        bDrainFlash  := FALSE;
+        bWaterFlash  := FALSE;
+        sCleanStatus := '';
+
+    nCLEAN_READY:
+        // circulation keeps running at the manual setpoint until drain starts
+        IF GVL_Process.bLevelEmpty THEN
+            GVL_IO.rPumpHz := 0.0;
+        ELSE
+            GVL_IO.rPumpHz := rManPumpHz;
+        END_IF
+        sCleanStatus := 'Open the drain, then press Start Clean';
+        IF bBtnStartClean THEN
+            nCleanStep := nCLEAN_DRAIN;
+        END_IF
+
+    nCLEAN_DRAIN:
+        // pump keeps running below the normal empty lockout - the goal IS 0 %
+        GVL_IO.rPumpHz := rManPumpHz;
+        sCleanStatus   := 'Draining tank...';
+        IF GVL_IO.rSPXLevel <= rCLEAN_EMPTY THEN
+            GVL_IO.rPumpHz := 0.0;
+            bDrainAck  := FALSE;
+            bWaterAck  := FALSE;
+            nCleanStep := nCLEAN_ACK;
+        END_IF
+
+    nCLEAN_ACK:
+        GVL_IO.rPumpHz := 0.0;
+        sCleanStatus   := 'Tank empty - close the drain and add water';
+        IF bBtnCloseDrain THEN bDrainAck := TRUE; END_IF
+        IF bBtnAddWater  THEN bWaterAck := TRUE; END_IF
+        bDrainFlash := (NOT bDrainAck) AND bBlinkPhase;
+        bWaterFlash := (NOT bWaterAck) AND bBlinkPhase;
+        IF bDrainAck AND bWaterAck THEN
+            bDrainFlash := FALSE;
+            bWaterFlash := FALSE;
+            nCleanStep  := nCLEAN_REFILL;
+        END_IF
+
+    nCLEAN_REFILL:
+        GVL_IO.rPumpHz := 0.0;
+        IF GVL_IO.rSPXLevel >= rCLEAN_FILL THEN
+            sCleanStatus := 'Ready - press Start Clean to flush the pipes';
+            IF bBtnStartClean THEN
+                tonFlush(IN := FALSE);           // make sure the timer restarts
+                nCleanStep := nCLEAN_FLUSHWAIT;
+            END_IF
+        ELSE
+            sCleanStatus := 'Fill the tank to 20% or more, then close the fill valve';
+            // Start Clean is ignored until the tank holds at least 20 %
+        END_IF
+
+    nCLEAN_FLUSHWAIT:
+        // circulate the fresh water while the countdown runs
+        GVL_IO.rPumpHz := rManPumpHz;
+        tonFlush(IN := TRUE, PT := tFLUSH_DELAY);
+        nFlushSecsLeft := DINT_TO_INT(
+            (TIME_TO_DINT(tFLUSH_DELAY) - TIME_TO_DINT(tonFlush.ET)) / 1000);
+        IF nFlushSecsLeft < 0 THEN nFlushSecsLeft := 0; END_IF
+        sCleanStatus := CONCAT(CONCAT('Opening SPX valve in ',
+                        INT_TO_STRING(nFlushSecsLeft)), ' s');
+        IF tonFlush.Q THEN
+            tonFlush(IN := FALSE);
+            bManSPXValve := TRUE;    // auto-'press' the manual SPX-valve button
+            nCleanStep   := nCLEAN_FLUSH;
+        END_IF
+
+    nCLEAN_FLUSH:
+        // pump pushes water through the open SPX line
+        IF GVL_IO.rSPXLevel <= rCLEAN_EMPTY THEN
+            // tank dry -> flush finished: stop and leave clean mode by itself
+            GVL_IO.rPumpHz := 0.0;
+            bManSPXValve   := FALSE;         // close the SPX valve
+            nCleanStep     := nCLEAN_OFF;
+        ELSE
+            GVL_IO.rPumpHz := rManPumpHz;
+            sCleanStatus   := 'Flushing pipes - press Stop Clean to finish';
+        END_IF
+
+END_CASE
+
+//------------------------------------------------------------------
+// post-clean empty latch: leaving clean mode with a dry tank (auto
+// flush-complete OR Stop Clean mid-way) must not latch the level-LOW
+// fault in MAIN. Suppressed until the tank is refilled above 5 %.
+//------------------------------------------------------------------
+IF bCleanPrev AND (nCleanStep = nCLEAN_OFF)
+   AND (GVL_IO.rSPXLevel < GVL_Param.rLevelEmpty) THEN
+    bPostCleanEmpty := TRUE;
+END_IF
+IF GVL_IO.rSPXLevel >= GVL_Param.rLevelEmpty THEN
+    bPostCleanEmpty := FALSE;    // refilled -> normal protection resumes
+END_IF
+bCleanPrev := (nCleanStep <> nCLEAN_OFF);
+
+// clean-button label follows the mode
+IF bCleanActive THEN
+    sCleanBtnText := 'STOP CLEAN';
+ELSE
+    sCleanBtnText := 'CLEAN MODE';
+END_IF
+
+//==================================================================
 // 7) CONSUME COMMAND BITS
 //   MAIN read them at the top of this scan; clearing here means the
-//   HMI button only has to write TRUE once per press.
+//   HMI button only has to write TRUE once per press. The clean
+//   buttons were consumed by section 6b just above.
 //==================================================================
 bCmdAuto  := FALSE;
 bCmdReset := FALSE;
-]]></ST>
+bBtnClean      := FALSE;
+bBtnStartClean := FALSE;
+bBtnCloseDrain := FALSE;
+bBtnAddWater   := FALSE;]]></ST>
     </Implementation>
   </POU>
 </TcPlcObject>

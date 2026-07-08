@@ -41,8 +41,12 @@ VAR CONSTANT
 	nERR_LEVEL_HIGH : INT := 50;   // SPX level above rLevelHigh (>95%)
 	nERR_LEVEL_LOW  : INT := 51;   // SPX level below rLevelEmpty (<5%)
     nERR_UNKNOWN_STATE   : INT := 99;   // illegal eState
-END_VAR
-]]></Declaration>
+
+    // level fault auto-clear hysteresis [%]: the level must come back
+    // this far INSIDE the band before the fault self-clears, so the
+    // fault cannot chatter on/off right at the threshold.
+    rLEVEL_CLEAR_HYST    : REAL := 2.0;
+END_VAR]]></Declaration>
     <Implementation>
       <ST><![CDATA[//==================================================================
 // MAIN - spray sequence + scheduling   (aligned to the Alfa/Brazil spec)
@@ -253,7 +257,16 @@ CASE eState OF
     //   top of their branch, then test for faults).
     //--------------------------------------------------------------
     E_SeqState.eFault:
-        IF rtReset.Q THEN
+        // LEVEL faults (50/51) self-clear as soon as the operator brings
+        // the tank back into band (refill after "low", drain after "high"),
+        // with hysteresis so the fault can't chatter at the threshold.
+        // Every other fault stays latched until Reset.
+        // NOTE: the safe-state overlay already dropped AUTO -> MANUAL, so
+        // after the auto-clear the machine sits safely in Idle/MANUAL and
+        // the operator re-arms AUTO deliberately.
+        IF rtReset.Q
+        OR (nErrorCode = nERR_LEVEL_LOW  AND GVL_IO.rSPXLevel >= GVL_Param.rLevelEmpty + rLEVEL_CLEAR_HYST)
+        OR (nErrorCode = nERR_LEVEL_HIGH AND GVL_IO.rSPXLevel <= GVL_Param.rLevelHigh  - rLEVEL_CLEAR_HYST) THEN
             bError     := FALSE;
             nErrorCode := nERR_NONE;
             eState     := E_SeqState.eIdle;
@@ -265,11 +278,18 @@ ELSE
 END_CASE
 
 //==================================================================
-// SPX LEVEL FAULT - out-of-band level raises a latched fault.
-//   AUTO only: in MANUAL the operator may work freely (warnings and
-//   the pump dry-run stop still apply, but nothing latches).
+// SPX LEVEL FAULT - out-of-band level raises a latched fault,
+//   but ONLY while AUTO is armed or a spray cycle is running.
+//   >95% = overfill,  <5% = dry/disconnected.
+//   In MANUAL + idle (operator draining / refilling / cleaning) NO
+//   fault is raised - the machine is still protected by:
+//     - the non-latching warnings on the Spray screen (PRG_Process)
+//     - the tank-empty pump lockout in PRG_Process (pump -> 0 Hz)
+//     - the AUTO start gate in eIdle (NOT bLevelEmpty)
+//   The fault self-clears in eFault once the level is back in band
+//   (see the eFault branch above); Reset also still works.
 //==================================================================
-IF (eState <> E_SeqState.eFault) AND bAutoMode THEN
+IF eState <> E_SeqState.eFault AND (bAutoMode OR eState <> E_SeqState.eIdle) THEN
     IF GVL_IO.rSPXLevel > GVL_Param.rLevelHigh THEN
         nErrorCode := nERR_LEVEL_HIGH;
         eState     := E_SeqState.eFault;
@@ -307,8 +327,7 @@ END_IF
 PRG_Process();   // level monitoring, pump P-control, circulation check
 PRG_Spray();     // Spray System screen      (page 0)
 PRG_Params();    // Machine Parameters screen (page 1)
-PRG_FileLogger(); // Logger for the machine
-]]></ST>
+PRG_FileLogger(); // Logger for the machine]]></ST>
     </Implementation>
   </POU>
 </TcPlcObject>
