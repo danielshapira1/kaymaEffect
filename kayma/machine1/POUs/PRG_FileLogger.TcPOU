@@ -2,126 +2,348 @@
 <TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
   <POU Name="PRG_FileLogger" Id="{48347e3b-6f89-4567-98bc-defbbc795fef}" SpecialFunc="None">
     <Declaration><![CDATA[PROGRAM PRG_FileLogger
+//==================================================================
+// MACHINE EVENT LOGGER (observer)
+//   Watches MAIN / GVL_Process / PRG_Spray / PRG_Params and logs one
+//   line per EVENT. By design there are NO duration measurements
+//   (no "step X took Y s") - only what happened and when.
+//
+//   File: <GVL_Param.sLogDir>/machine_events_YYYY-MM.log
+//         (one file per month; legend header on boot/rollover)
+//   Tags: [.] INFO   [!] WARN   [X] ERROR
+//
+//   Severity map:
+//     [X] ERROR - latched sequence faults          (MAIN.nErrorCode)
+//     [!] WARN  - process warnings, cycle aborts,  (GVL_Process.bWarn*,
+//                 parameter changes (applied/reset)  AUTO abort, PRG_Params)
+//                 and rejected parameter writes
+//     [.] INFO  - boot, AUTO/MANUAL, manual presses, cycle start/
+//                 complete, fault reset, state changes, param snapshots
+//
+//   PARAM SNAPSHOT (for the Grafana dashboard): one INFO line with ALL
+//   current machine parameters ('Params snapshot: T1=... Pump=...Hz')
+//   is written at boot, after every accepted Apply/Reset, and every
+//   tSnapBeat (heartbeat) so the dashboard's lookback window always
+//   finds a fresh one. Grafana extracts the numbers with regexp+unwrap.
+//
+//   All detection lives HERE - no other POU was touched. If you ever
+//   want to log directly from another POU (same task!), you can:
+//       PRG_FileLogger.fbLog.Info('my message');
+//
+//   Log file health: watch fbLog.nFailCount / nDropped / nLastErrId /
+//   sLastPath online if the file stays empty (Linux: permissions!).
+//==================================================================
 VAR
-	// ---- config ----
-    sFileName  : STRING(255) := 'spx_level_low.log';  // in the TwinCAT Boot folder (see ePath below)
-    tCooldown  : TIME := T#60S;   // min. spacing between logged events (guards against
-                                  // chatter if the level hovers right at the threshold)
+    fbLog : FB_EventLog := (sBaseName := 'machine_events');
 
-    // ---- event detection ----
-    rtLow      : R_TRIG;          // rising edge of the warning
-    tonCool    : TON;
-    bCool      : BOOL;
+    // ---- one-shot startup ----
+    bStartupLogged : BOOL;
 
-    // ---- timestamp ----
-    fbTime     : FB_LocalSystemTime := (bEnable := TRUE, dwCycle := 1);
+    // ---- previous-scan copies for change detection ----
+    ePrevState : E_SeqState := E_SeqState.eIdle;
+    bPrevAuto  : BOOL;
+    nLastFault : INT;              // captured on fault entry (MAIN clears nErrorCode on reset)
 
-    // ---- file access (Tc2_System) ----
-    fbOpen     : FB_FileOpen;
-    fbWrite    : FB_FileWrite;
-    fbClose    : FB_FileClose;
-    hFile      : UINT;
-    eStep      : (IDLE, OPEN_FILE, WRITE_LINE, CLOSE_FILE);
+    // ---- manual-mode presses ----
+    bPrevManAir    : BOOL;
+    bPrevManSPX    : BOOL;
+    bPrevManPOpen  : BOOL;
+    bPrevManPClose : BOOL;
+    rPrevManHz     : REAL := 15.0; // matches PRG_Spray init -> no ghost line at boot
 
-    // ---- line buffers ----
-    sNew       : STRING(255);
-    sLine      : STRING(255);     // line currently being written
-    sPending   : STRING(255);     // one-slot queue if an event lands mid-write
+    // ---- process-warning edges + chatter cooldowns ----
+    // (cooldown only for the analog level thresholds, where the value
+    //  can hover at the limit; the per-cycle warnings are edge-only)
+    rtLevelLow   : R_TRIG;   tonCoolLow   : TON;   bCoolLow   : BOOL;
+    rtLevelHigh  : R_TRIG;   tonCoolHigh  : TON;   bCoolHigh  : BOOL;
+    rtLevelEmpty : R_TRIG;   tonCoolEmpty : TON;   bCoolEmpty : BOOL;
+    rtBadSPX     : R_TRIG;
+    rtCircPress  : R_TRIG;
+    tCooldown    : TIME := T#60S;  // min spacing per level warning
 
-    // ---- diagnostics (watch these online if nothing appears in the file) ----
-    nLastErrId : UDINT;           // last ADS error id from open/write
-    nFailCount : UINT;            // events lost to file errors
-END_VAR
-]]></Declaration>
+    // ---- HMI / parameter events ----
+    rtParamMsg : R_TRIG;
+
+    // ---- parameter snapshot (full current values, for the dashboard) ----
+    bSnapReq    : BOOL;            // one-shot: write a snapshot this scan
+    tonSnapBeat : TON;             // heartbeat -> Grafana lookback always hits
+    tSnapBeat   : TIME := T#6H;    // snapshot spacing (4 lines/day)
+
+    // ---- scratch line builder ----
+    sTxt : STRING(255);
+END_VAR]]></Declaration>
     <Implementation>
-      <ST><![CDATA[// ---- time base (cyclic) ----
-fbTime();
-
-// ---- edge detection + cooldown ----
-rtLow(CLK := GVL_Process.bWarnLevelLow);
-
-tonCool(IN := bCool, PT := tCooldown);
-IF tonCool.Q THEN
-    bCool := FALSE;
+      <ST><![CDATA[//------------------------------------------------------------------
+// 0) STARTUP  (once, as soon as the local clock is valid)
+//------------------------------------------------------------------
+IF NOT bStartupLogged AND fbLog.bTimeValid THEN
+    bStartupLogged := TRUE;
+    fbLog.Info('=== PLC application started ===');
+    IF SIM_Plant.bSimEnable THEN
+        fbLog.Warn('SIMULATION mode active - I/O is simulated, not real hardware');
+    END_IF
+    bSnapReq := TRUE;              // boot -> log the full parameter set
 END_IF
 
-IF rtLow.Q AND NOT bCool AND fbTime.bValid THEN
-    bCool := TRUE;
+//------------------------------------------------------------------
+// 1) SEQUENCE STATE CHANGES  (faults, resets, cycle start/complete)
+//------------------------------------------------------------------
+IF MAIN.eState <> ePrevState THEN
 
-    // Build the line NOW, so the timestamp and level are from the moment
-    // of the event, not from when the file write happens to finish.
-    sNew := SYSTEMTIME_TO_STRING(fbTime.systemTime);
-    sNew := CONCAT(sNew, '  WARN  SPX level low: ');
-    sNew := CONCAT(sNew, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_IO.rSPXLevel), 1, TRUE));
-    sNew := CONCAT(sNew, ' %  (limit ');
-    sNew := CONCAT(sNew, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Param.rLevelLow), 1, TRUE));
-    sNew := CONCAT(sNew, ' %)$N');
+    IF MAIN.eState = E_SeqState.eFault THEN
+        // ---------- [X] fault raised ----------
+        nLastFault := MAIN.nErrorCode;
+        sTxt := 'FAULT ';
+        sTxt := CONCAT(sTxt, INT_TO_STRING(MAIN.nErrorCode));
+        sTxt := CONCAT(sTxt, ': ');
+        CASE MAIN.nErrorCode OF
+            10: sTxt := CONCAT(sTxt, 'piston not at P-close');
+            20: sTxt := CONCAT(sTxt, 'SPX valve stuck - never Fully Open (T2)');
+            21: sTxt := CONCAT(sTxt, 'SPX valve stuck - never Fully Close (T6)');
+            30: sTxt := CONCAT(sTxt, 'piston opening stroke timeout (T3)');
+            40: sTxt := CONCAT(sTxt, 'piston closing stroke timeout (T4)');
+            50: sTxt := CONCAT(sTxt, 'SPX level HIGH');
+            51: sTxt := CONCAT(sTxt, 'SPX level EMPTY');
+        ELSE
+            sTxt := CONCAT(sTxt, 'unknown state');
+        END_CASE
+        sTxt := CONCAT(sTxt, ' (in ');
+        sTxt := CONCAT(sTxt, TO_STRING(ePrevState));
+        sTxt := CONCAT(sTxt, ', level ');
+        sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_IO.rSPXLevel), 1, TRUE));
+        sTxt := CONCAT(sTxt, ' %) - outputs safe, AUTO dropped');
+        fbLog.Error(sTxt);
 
-    IF eStep = IDLE THEN
-        sLine := sNew;
-        eStep := OPEN_FILE;
-    ELSE
-        sPending := sNew;         // extremely unlikely at this rate, but safe
+    ELSIF ePrevState = E_SeqState.eFault AND MAIN.eState = E_SeqState.eIdle THEN
+        // ---------- [.] fault reset by operator ----------
+        sTxt := 'Fault reset by operator (was FAULT ';
+        sTxt := CONCAT(sTxt, INT_TO_STRING(nLastFault));
+        sTxt := CONCAT(sTxt, ')');
+        fbLog.Info(sTxt);
+
+    ELSIF ePrevState = E_SeqState.eIdle AND MAIN.eState = E_SeqState.eDewater THEN
+        // ---------- [.] spray cycle started (mother handshake accepted) ----------
+        sTxt := 'Spray cycle started (SPX level ';
+        sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_IO.rSPXLevel), 1, TRUE));
+        sTxt := CONCAT(sTxt, ' %, pump ');
+        sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_IO.rPumpHz), 1, TRUE));
+        sTxt := CONCAT(sTxt, ' Hz)');
+        fbLog.Info(sTxt);
+
+    ELSIF ePrevState = E_SeqState.eCloseDewater AND MAIN.eState = E_SeqState.eIdle THEN
+        // ---------- [.] spray cycle completed ----------
+        // (PRG_Process already updated the averages + pump correction this
+        //  same scan - it runs before this program in MAIN's call list)
+        sTxt := 'Spray cycle completed (SPX avg T3 ';
+        sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Process.rSPXAvgT3), 2, TRUE));
+        sTxt := CONCAT(sTxt, ' / T4 ');
+        sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Process.rSPXAvgT4), 2, TRUE));
+        sTxt := CONCAT(sTxt, ' bar, pump -> ');
+        sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_IO.rPumpHz), 1, TRUE));
+        sTxt := CONCAT(sTxt, ' Hz)');
+        fbLog.Info(sTxt);
+
+    ELSIF GVL_Param.bLogStateChanges THEN
+        // ---------- [.] any other transition (verbose, switchable) ----------
+        sTxt := 'State: ';
+        sTxt := CONCAT(sTxt, TO_STRING(ePrevState));
+        sTxt := CONCAT(sTxt, ' -> ');
+        sTxt := CONCAT(sTxt, TO_STRING(MAIN.eState));
+        fbLog.Info(sTxt);
     END_IF
 END_IF
 
-// ---- file state machine: open (append) -> write -> close ----
-CASE eStep OF
+//------------------------------------------------------------------
+// 2) AUTO / MANUAL  (before updating ePrevState - the abort message
+//    uses it to know whether a cycle was running)
+//------------------------------------------------------------------
+IF MAIN.bAutoMode AND NOT bPrevAuto THEN
+    fbLog.Info('AUTO armed by operator');
+ELSIF NOT MAIN.bAutoMode AND bPrevAuto AND NOT MAIN.bError THEN
+    // (a fault also drops AUTO, but that's already in the [X] line)
+    IF ePrevState <> E_SeqState.eIdle AND ePrevState <> E_SeqState.eFault THEN
+        sTxt := 'AUTO stopped by operator - running cycle ABORTED to idle (was in ';
+        sTxt := CONCAT(sTxt, TO_STRING(ePrevState));
+        sTxt := CONCAT(sTxt, ')');
+        fbLog.Warn(sTxt);
+    ELSE
+        fbLog.Info('AUTO stopped by operator -> MANUAL');
+    END_IF
+END_IF
+bPrevAuto  := MAIN.bAutoMode;
+ePrevState := MAIN.eState;
 
-    IDLE:
-        IF sPending <> '' THEN    // a line queued up while we were busy
-            sLine    := sPending;
-            sPending := '';
-            eStep    := OPEN_FILE;
+//------------------------------------------------------------------
+// 2b) MANUAL PRESSES  (brief one-liners; only while manual is live.
+//     PRG_Spray force-clears the flags on manual exit - not logged.)
+//------------------------------------------------------------------
+IF PRG_Spray.bManualActive THEN
+    IF PRG_Spray.bManAirValve <> bPrevManAir THEN
+        IF PRG_Spray.bManAirValve THEN fbLog.Info('MAN: Air ON');
+        ELSE fbLog.Info('MAN: Air OFF'); END_IF
+    END_IF
+    IF PRG_Spray.bManSPXValve <> bPrevManSPX THEN
+        IF PRG_Spray.bManSPXValve THEN fbLog.Info('MAN: SPX ON');
+        ELSE fbLog.Info('MAN: SPX OFF'); END_IF
+    END_IF
+    IF PRG_Spray.bManPistonOpen <> bPrevManPOpen THEN
+        IF PRG_Spray.bManPistonOpen THEN fbLog.Info('MAN: Piston-open sol ON');
+        ELSE fbLog.Info('MAN: Piston-open sol OFF'); END_IF
+    END_IF
+    IF PRG_Spray.bManPistonClose <> bPrevManPClose THEN
+        IF PRG_Spray.bManPistonClose THEN fbLog.Info('MAN: Piston-close sol ON');
+        ELSE fbLog.Info('MAN: Piston-close sol OFF'); END_IF
+    END_IF
+    IF ABS(PRG_Spray.rManPumpHz - rPrevManHz) > 0.05 THEN
+        sTxt := 'MAN: Pump ';
+        sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(PRG_Spray.rManPumpHz), 1, TRUE));
+        sTxt := CONCAT(sTxt, ' Hz');
+        fbLog.Info(sTxt);
+    END_IF
+END_IF
+// sync prev copies every scan -> no ghost edges when re-entering manual
+bPrevManAir    := PRG_Spray.bManAirValve;
+bPrevManSPX    := PRG_Spray.bManSPXValve;
+bPrevManPOpen  := PRG_Spray.bManPistonOpen;
+bPrevManPClose := PRG_Spray.bManPistonClose;
+rPrevManHz     := PRG_Spray.rManPumpHz;
+
+//------------------------------------------------------------------
+// 3) PROCESS WARNINGS  (non-latching flags from GVL_Process)
+//------------------------------------------------------------------
+// -- SPX level low (< rLevelLow) --
+tonCoolLow(IN := bCoolLow, PT := tCooldown);
+IF tonCoolLow.Q THEN bCoolLow := FALSE; END_IF
+rtLevelLow(CLK := GVL_Process.bWarnLevelLow);
+IF rtLevelLow.Q AND NOT bCoolLow THEN
+    bCoolLow := TRUE;
+    sTxt := 'SPX level low: ';
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_IO.rSPXLevel), 1, TRUE));
+    sTxt := CONCAT(sTxt, ' % (limit ');
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Param.rLevelLow), 1, TRUE));
+    sTxt := CONCAT(sTxt, ' %)');
+    fbLog.Warn(sTxt);
+END_IF
+
+// -- SPX level high (> rLevelHigh) --
+tonCoolHigh(IN := bCoolHigh, PT := tCooldown);
+IF tonCoolHigh.Q THEN bCoolHigh := FALSE; END_IF
+rtLevelHigh(CLK := GVL_Process.bWarnLevelHigh);
+IF rtLevelHigh.Q AND NOT bCoolHigh THEN
+    bCoolHigh := TRUE;
+    sTxt := 'SPX level high: ';
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_IO.rSPXLevel), 1, TRUE));
+    sTxt := CONCAT(sTxt, ' % (limit ');
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Param.rLevelHigh), 1, TRUE));
+    sTxt := CONCAT(sTxt, ' %)');
+    fbLog.Warn(sTxt);
+END_IF
+
+// -- SPX tank empty (< rLevelEmpty) - lockout (fault 51 logs the [X]) --
+tonCoolEmpty(IN := bCoolEmpty, PT := tCooldown);
+IF tonCoolEmpty.Q THEN bCoolEmpty := FALSE; END_IF
+rtLevelEmpty(CLK := GVL_Process.bLevelEmpty);
+IF rtLevelEmpty.Q AND NOT bCoolEmpty THEN
+    bCoolEmpty := TRUE;
+    sTxt := 'SPX tank EMPTY: ';
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_IO.rSPXLevel), 1, TRUE));
+    sTxt := CONCAT(sTxt, ' % (< ');
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Param.rLevelEmpty), 1, TRUE));
+    sTxt := CONCAT(sTxt, ' %) - pump stopped, mother release blocked');
+    fbLog.Warn(sTxt);
+END_IF
+
+// -- bad SPX spray pressure (set after a stroke; cleared at cycle start) --
+// (if it fires on the OPENING stroke, the T4 average shown is still
+//  from the previous cycle - only T3 is fresh at that moment)
+rtBadSPX(CLK := GVL_Process.bWarnBadSPX);
+IF rtBadSPX.Q THEN
+    sTxt := 'Bad SPX pressure: avg T3 ';
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Process.rSPXAvgT3), 2, TRUE));
+    sTxt := CONCAT(sTxt, ' / T4 ');
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Process.rSPXAvgT4), 2, TRUE));
+    sTxt := CONCAT(sTxt, ' bar (target ');
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Param.rSPXPressureTarget), 2, TRUE));
+    sTxt := CONCAT(sTxt, ' +/- ');
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Param.rSPXPressTol), 2, TRUE));
+    sTxt := CONCAT(sTxt, ')');
+    fbLog.Warn(sTxt);
+END_IF
+
+// -- circulation pressure mismatch (recomputed at each cycle end) --
+rtCircPress(CLK := GVL_Process.bWarnCircPress);
+IF rtCircPress.Q THEN
+    sTxt := 'Adjust circulation pressure: spray avg ';
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Process.rSPXAvg), 2, TRUE));
+    sTxt := CONCAT(sTxt, ' vs circulation avg ');
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Process.rSPXAvgCirc), 2, TRUE));
+    sTxt := CONCAT(sTxt, ' bar (tol ');
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Param.rCircPressTol), 2, TRUE));
+    sTxt := CONCAT(sTxt, ')');
+    fbLog.Warn(sTxt);
+END_IF
+
+//------------------------------------------------------------------
+// 4) PARAMETER SCREEN EVENTS  (PRG_Params runs earlier this scan;
+//    bMsgTrig is TRUE for exactly the Apply/Reset press scan)
+//------------------------------------------------------------------
+rtParamMsg(CLK := PRG_Params.bMsgTrig);
+IF rtParamMsg.Q THEN
+    IF NOT PRG_Params.bLastApplyOk THEN
+        // 'Rejected: sequence not idle' / 'Rejected: values must be > 0'
+        sTxt := CONCAT('Parameters: ', PRG_Params.sParamStatus);
+        fbLog.Warn(sTxt);
+    ELSIF PRG_Params.sChangeList <> '' THEN
+        // only the params that actually changed, old->new
+        // (list is built by PRG_Params, where old and new coexist)
+        IF PRG_Params.bLastWasReset THEN
+            sTxt := 'Parameters RESET to defaults: ';
+        ELSE
+            sTxt := 'Parameters applied: ';
         END_IF
+        sTxt := CONCAT(sTxt, PRG_Params.sChangeList);
+        fbLog.Warn(sTxt);          // WARN so it shows on the Warnings dashboard
+        bSnapReq := TRUE;          // and refresh the full snapshot right after
+    END_IF
+    // accepted but nothing changed -> stay silent (no log spam)
+END_IF
 
-    OPEN_FILE:
-        fbOpen(sNetId    := '',
-               sPathName := sFileName,
-               nMode     := FOPEN_MODEAPPEND OR FOPEN_MODETEXT,
-               ePath     := PATH_BOOTPATH,
-               tTimeout  := T#3S,
-               bExecute  := TRUE);
-        IF NOT fbOpen.bBusy THEN
-            fbOpen(bExecute := FALSE);
-            IF fbOpen.bError THEN
-                nLastErrId := fbOpen.nErrId;
-                nFailCount := nFailCount + 1;
-                eStep := IDLE;    // drop this line, never block the machine
-            ELSE
-                hFile := fbOpen.hFile;
-                eStep := WRITE_LINE;
-            END_IF
-        END_IF
+//------------------------------------------------------------------
+// 4b) PARAMETER SNAPSHOT  (full current values in ONE machine-parsable
+//     INFO line - the Grafana "Current parameters" panels read this.
+//     Written at boot, after every accepted Apply/Reset, and every
+//     tSnapBeat as a heartbeat. Keep the 'key=value' format stable:
+//     the dashboard regexes depend on it!)
+//------------------------------------------------------------------
+tonSnapBeat(IN := NOT tonSnapBeat.Q, PT := tSnapBeat);   // self-retriggering
+IF tonSnapBeat.Q THEN
+    bSnapReq := TRUE;
+END_IF
 
-    WRITE_LINE:
-        fbWrite(sNetId     := '',
-                hFile      := hFile,
-                pWriteBuff := ADR(sLine),
-                cbWriteLen := TO_UDINT(LEN(sLine)),
-                tTimeout   := T#3S,
-                bExecute   := TRUE);
-        IF NOT fbWrite.bBusy THEN
-            fbWrite(bExecute := FALSE);
-            IF fbWrite.bError THEN
-                nLastErrId := fbWrite.nErrId;
-                nFailCount := nFailCount + 1;
-            END_IF
-            eStep := CLOSE_FILE;  // always close, even after a write error
-        END_IF
+IF bSnapReq AND fbLog.bTimeValid THEN
+    bSnapReq := FALSE;
+    // (T2/T6 and T3/T4 are always written as pairs by PRG_Params,
+    //  so logging T2 and T3 represents both members of each pair)
+    sTxt := 'Params snapshot: T1=';
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(TIME_TO_LREAL(GVL_Param.tDewaterTime) / 1000.0, 1, TRUE));
+    sTxt := CONCAT(sTxt, 's T2/T6=');
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(TIME_TO_LREAL(GVL_Param.tSPXMaxOpenTime) / 1000.0, 1, TRUE));
+    sTxt := CONCAT(sTxt, 's T3/T4=');
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(TIME_TO_LREAL(GVL_Param.tSprayOpenTime) / 1000.0, 1, TRUE));
+    sTxt := CONCAT(sTxt, 's T5=');
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(TIME_TO_LREAL(GVL_Param.tSPXDewaterTime) / 1000.0, 1, TRUE));
+    sTxt := CONCAT(sTxt, 's SPX=');
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Param.rSPXPressureTarget), 2, TRUE));
+    sTxt := CONCAT(sTxt, 'bar Pump=');
+    sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Param.rPumpSpeedBase), 1, TRUE));
+    sTxt := CONCAT(sTxt, 'Hz');
+    fbLog.Info(sTxt);
+END_IF
 
-    CLOSE_FILE:
-        fbClose(sNetId   := '',
-                hFile    := hFile,
-                tTimeout := T#3S,
-                bExecute := TRUE);
-        IF NOT fbClose.bBusy THEN
-            fbClose(bExecute := FALSE);
-            hFile := 0;
-            eStep := IDLE;
-        END_IF
-
-END_CASE]]></ST>
+//------------------------------------------------------------------
+// 5) run the logger (drains the queue to the file)
+//------------------------------------------------------------------
+fbLog();]]></ST>
     </Implementation>
   </POU>
 </TcPlcObject>

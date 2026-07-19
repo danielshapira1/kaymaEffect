@@ -6,6 +6,9 @@
 // MACHINE PARAMETERS SCREEN  (page 1)
 //   The operator edits the *Edit* copies (tap a value -> numeric keypad);
 //   LOAD pulls the live values in, APPLY writes them to GVL_Param.
+//   RESET loads the factory defaults (GVL_Param.cDef*) into the edit
+//   copies and then runs the EXACT same gate as APPLY (idle + sanity).
+//   The RESET button is only visible in manual mode on the HMI.
 //
 //   The time fields are edited as REAL SECONDS (so the HMI keypad shows
 //   plain decimals: 4, 0.5, 3.0, 10) and converted to TIME on apply.
@@ -13,6 +16,12 @@
 //     "T2 & T6" -> rEditValveMax_s   (writes both watchdogs)
 //     "T3 & T4" -> rEditSprayTime_s   (writes both watchdogs)
 //   APPLY is only accepted while the sequence is idle.
+//
+//   For the event logger (PRG_FileLogger reads these on bMsgTrig):
+//     bLastApplyOk  - result of the last Apply/Reset press
+//     bLastWasReset - that press came from the RESET button
+//     sChangeList   - ONLY the params that changed, 'old->new' each;
+//                     EMPTY if identical values were applied (not logged)
 //==================================================================
 VAR
     // ---- editable copies in SECONDS (bound to the HMI keypad fields) ----
@@ -26,23 +35,36 @@ VAR
     // ---- buttons ----
     bBtnApply : BOOL;          // "Apply" (write edits to GVL_Param)
     bBtnLoad  : BOOL;          // "Reload" (discard edits, pull live values)
+    bBtnReset : BOOL;          // "Reset defaults" (manual mode only on the HMI)
 
     // ---- status ----
     bApplyAllowed : BOOL;      // TRUE while edits may be applied (idle)
     sParamStatus  : STRING := 'Ready';
     bInit         : BOOL;      // first-scan load
 
+    // ---- info for the event logger (PRG_FileLogger) ----
+    bLastApplyOk  : BOOL;          // result of the last Apply/Reset press
+    bLastWasReset : BOOL;          // TRUE if that press was the RESET button
+    sChangeList   : STRING(255);   // changed params only, old->new
+
     // ---- 5 s message window (drives HMI message visibility) ----
     bMsgVisible : BOOL;        // TRUE for 5 s after Apply, then FALSE
-    bMsgTrig    : BOOL;        // one-scan trigger (Apply pressed)
+    bMsgTrig    : BOOL;        // one-scan trigger (Apply/Reset pressed)
     tonMsg      : TON;         // 5 s display timer
+
+    // ---- internal ----
+    bResetActive : BOOL;       // current press came from RESET
+    tNewT1  : TIME;            // converted-once new values (also used
+    tNewT26 : TIME;            //  for the changed/unchanged comparison)
+    tNewT34 : TIME;
+    tNewT5  : TIME;
+    rOldVal : REAL;            // scratch: old value in display units
 END_VAR
 
 VAR CONSTANT
     rMS_PER_S  : REAL := 1000.0;
     tMSG_SHOW  : TIME := T#3S;   // how long the status / banner stays visible
-END_VAR
-]]></Declaration>
+END_VAR]]></Declaration>
     <Implementation>
       <ST><![CDATA[// On the first scan, pull the live parameters into the edit copies.
 bMsgTrig := FALSE;   // reset the one-scan message trigger
@@ -67,27 +89,112 @@ IF bBtnLoad THEN
     sParamStatus      := 'Loaded';
 END_IF
 
+// ---- RESET: factory defaults -> edit copies, then the SAME path as APPLY ----
+//   (the HMI shows this button only in manual mode; the idle gate and the
+//    sanity checks below still run exactly as for a normal Apply)
+IF bBtnReset THEN
+    bBtnReset := FALSE;
+    rEditDewater_s    := DINT_TO_REAL(TIME_TO_DINT(GVL_Param.cDefDewaterTime))    / rMS_PER_S;
+    rEditValveMax_s   := DINT_TO_REAL(TIME_TO_DINT(GVL_Param.cDefValveMaxTime))   / rMS_PER_S;
+    rEditSprayTime_s  := DINT_TO_REAL(TIME_TO_DINT(GVL_Param.cDefSprayTime))      / rMS_PER_S;
+    rEditSPXDewater_s := DINT_TO_REAL(TIME_TO_DINT(GVL_Param.cDefSPXDewaterTime)) / rMS_PER_S;
+    rEditPressTarget  := GVL_Param.cDefPressTarget;
+    rEditPumpSpeed    := GVL_Param.cDefPumpSpeed;
+    bResetActive := TRUE;
+    bBtnApply    := TRUE;    // fall through into the apply gate below
+END_IF
+
 // ---- APPLY: edit copies (REAL seconds) -> live (TIME), idle + sanity ----
 IF bBtnApply THEN
     bBtnApply := FALSE;
     bMsgTrig  := TRUE;     // show the status (and the manual banner) for 3 s
     IF NOT bApplyAllowed THEN
         sParamStatus := 'Rejected: sequence not idle';
+        bLastApplyOk := FALSE;
     ELSIF (rEditDewater_s <= 0.0) OR (rEditValveMax_s <= 0.0) OR (rEditSprayTime_s <= 0.0)
        OR (rEditSPXDewater_s <= 0.0) OR (rEditPumpSpeed <= 0.0) THEN
         sParamStatus := 'Rejected: values must be > 0';
+        bLastApplyOk := FALSE;
     ELSE
-        // seconds -> milliseconds -> TIME
-        GVL_Param.tDewaterTime       := DINT_TO_TIME(REAL_TO_DINT(rEditDewater_s    * rMS_PER_S));
-        GVL_Param.tSPXMaxOpenTime    := DINT_TO_TIME(REAL_TO_DINT(rEditValveMax_s   * rMS_PER_S));  // T2
-        GVL_Param.tSPXMaxCloseTime   := DINT_TO_TIME(REAL_TO_DINT(rEditValveMax_s   * rMS_PER_S));  // T6 (shares value)
-        GVL_Param.tSprayOpenTime     := DINT_TO_TIME(REAL_TO_DINT(rEditSprayTime_s  * rMS_PER_S));  // T3
-        GVL_Param.tSprayCloseTime    := DINT_TO_TIME(REAL_TO_DINT(rEditSprayTime_s  * rMS_PER_S));  // T4 (shares value)
-        GVL_Param.tSPXDewaterTime    := DINT_TO_TIME(REAL_TO_DINT(rEditSPXDewater_s * rMS_PER_S));
+        // seconds -> milliseconds -> TIME (converted once, reused below)
+        tNewT1  := DINT_TO_TIME(REAL_TO_DINT(rEditDewater_s    * rMS_PER_S));
+        tNewT26 := DINT_TO_TIME(REAL_TO_DINT(rEditValveMax_s   * rMS_PER_S));
+        tNewT34 := DINT_TO_TIME(REAL_TO_DINT(rEditSprayTime_s  * rMS_PER_S));
+        tNewT5  := DINT_TO_TIME(REAL_TO_DINT(rEditSPXDewater_s * rMS_PER_S));
+
+        // ---- change list: ONLY the params that actually change (old->new) ----
+        sChangeList := '';
+        IF tNewT1 <> GVL_Param.tDewaterTime THEN
+            rOldVal := DINT_TO_REAL(TIME_TO_DINT(GVL_Param.tDewaterTime)) / rMS_PER_S;
+            sChangeList := CONCAT(sChangeList, 'T1 ');
+            sChangeList := CONCAT(sChangeList, LREAL_TO_FMTSTR(REAL_TO_LREAL(rOldVal), 1, TRUE));
+            sChangeList := CONCAT(sChangeList, '->');
+            sChangeList := CONCAT(sChangeList, LREAL_TO_FMTSTR(REAL_TO_LREAL(rEditDewater_s), 1, TRUE));
+            sChangeList := CONCAT(sChangeList, 's, ');
+        END_IF
+        IF tNewT26 <> GVL_Param.tSPXMaxOpenTime THEN     // T2 & T6 always written as a pair
+            rOldVal := DINT_TO_REAL(TIME_TO_DINT(GVL_Param.tSPXMaxOpenTime)) / rMS_PER_S;
+            sChangeList := CONCAT(sChangeList, 'T2/T6 ');
+            sChangeList := CONCAT(sChangeList, LREAL_TO_FMTSTR(REAL_TO_LREAL(rOldVal), 1, TRUE));
+            sChangeList := CONCAT(sChangeList, '->');
+            sChangeList := CONCAT(sChangeList, LREAL_TO_FMTSTR(REAL_TO_LREAL(rEditValveMax_s), 1, TRUE));
+            sChangeList := CONCAT(sChangeList, 's, ');
+        END_IF
+        IF tNewT34 <> GVL_Param.tSprayOpenTime THEN      // T3 & T4 always written as a pair
+            rOldVal := DINT_TO_REAL(TIME_TO_DINT(GVL_Param.tSprayOpenTime)) / rMS_PER_S;
+            sChangeList := CONCAT(sChangeList, 'T3/T4 ');
+            sChangeList := CONCAT(sChangeList, LREAL_TO_FMTSTR(REAL_TO_LREAL(rOldVal), 1, TRUE));
+            sChangeList := CONCAT(sChangeList, '->');
+            sChangeList := CONCAT(sChangeList, LREAL_TO_FMTSTR(REAL_TO_LREAL(rEditSprayTime_s), 1, TRUE));
+            sChangeList := CONCAT(sChangeList, 's, ');
+        END_IF
+        IF tNewT5 <> GVL_Param.tSPXDewaterTime THEN
+            rOldVal := DINT_TO_REAL(TIME_TO_DINT(GVL_Param.tSPXDewaterTime)) / rMS_PER_S;
+            sChangeList := CONCAT(sChangeList, 'T5 ');
+            sChangeList := CONCAT(sChangeList, LREAL_TO_FMTSTR(REAL_TO_LREAL(rOldVal), 1, TRUE));
+            sChangeList := CONCAT(sChangeList, '->');
+            sChangeList := CONCAT(sChangeList, LREAL_TO_FMTSTR(REAL_TO_LREAL(rEditSPXDewater_s), 1, TRUE));
+            sChangeList := CONCAT(sChangeList, 's, ');
+        END_IF
+        IF rEditPressTarget <> GVL_Param.rSPXPressureTarget THEN
+            sChangeList := CONCAT(sChangeList, 'Ptgt ');
+            sChangeList := CONCAT(sChangeList, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Param.rSPXPressureTarget), 2, TRUE));
+            sChangeList := CONCAT(sChangeList, '->');
+            sChangeList := CONCAT(sChangeList, LREAL_TO_FMTSTR(REAL_TO_LREAL(rEditPressTarget), 2, TRUE));
+            sChangeList := CONCAT(sChangeList, 'bar, ');
+        END_IF
+        IF rEditPumpSpeed <> GVL_Param.rPumpSpeedBase THEN
+            sChangeList := CONCAT(sChangeList, 'Pump ');
+            sChangeList := CONCAT(sChangeList, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_Param.rPumpSpeedBase), 1, TRUE));
+            sChangeList := CONCAT(sChangeList, '->');
+            sChangeList := CONCAT(sChangeList, LREAL_TO_FMTSTR(REAL_TO_LREAL(rEditPumpSpeed), 1, TRUE));
+            sChangeList := CONCAT(sChangeList, 'Hz, ');
+        END_IF
+        IF sChangeList <> '' THEN
+            sChangeList := LEFT(sChangeList, LEN(sChangeList) - 2);   // drop trailing ', '
+        END_IF
+
+        // ---- write ----
+        GVL_Param.tDewaterTime       := tNewT1;
+        GVL_Param.tSPXMaxOpenTime    := tNewT26;   // T2
+        GVL_Param.tSPXMaxCloseTime   := tNewT26;   // T6 (shares value)
+        GVL_Param.tSprayOpenTime     := tNewT34;   // T3
+        GVL_Param.tSprayCloseTime    := tNewT34;   // T4 (shares value)
+        GVL_Param.tSPXDewaterTime    := tNewT5;
         GVL_Param.rSPXPressureTarget := rEditPressTarget;
         GVL_Param.rPumpSpeedBase     := rEditPumpSpeed;
-        sParamStatus := 'Applied';
+
+        bLastApplyOk := TRUE;
+        IF sChangeList = '' THEN
+            sParamStatus := 'No changes';        // accepted, nothing to do -> NOT logged
+        ELSIF bResetActive THEN
+            sParamStatus := 'Reset to defaults';
+        ELSE
+            sParamStatus := 'Applied';
+        END_IF
     END_IF
+    bLastWasReset := bResetActive;   // tell the logger where this press came from
+    bResetActive  := FALSE;
 END_IF
 
 // ---- 5 s message window ----
@@ -100,8 +207,7 @@ END_IF
 tonMsg(IN := bMsgVisible, PT := tMSG_SHOW);
 IF tonMsg.Q THEN
     bMsgVisible := FALSE;
-END_IF
-]]></ST>
+END_IF]]></ST>
     </Implementation>
   </POU>
 </TcPlcObject>

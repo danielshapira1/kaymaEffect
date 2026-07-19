@@ -1,0 +1,254 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="PRG_StatsLogger" Id="{edee526b-bfb5-4e15-b94b-ec4406bbbaaa}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM PRG_StatsLogger
+VAR
+    fbTime     : FB_LocalSystemTime := (bEnable := TRUE, dwCycle := 1);
+    tsNow         : TIMESTRUCT;
+
+    // ---- sampling ----
+    tonSample  : TON;
+    bDue       : BOOL;
+    bActive    : BOOL;
+    bInWindow  : BOOL;
+    tPeriod    : TIME;
+    ePrevState : E_SeqState := E_SeqState.eIdle;
+    bPrevAuto  : BOOL;
+
+    // ---- time-in-state accumulators (for uptime %) ----
+    tonSec     : TON;
+    nRunSec    : UDINT;   // resets on PLC restart (by design)
+    nIdleSec   : UDINT;
+    nFaultSec  : UDINT;
+
+    // ---- line queue (writer drains it; survives short disk hiccups) ----
+    aQ         : ARRAY [0..15] OF STRING(255);
+    nHead      : INT;
+    nTail      : INT;
+    nCount     : INT;
+    nDropped   : UDINT;
+
+    // ---- file writer state machine ----
+    eWr        : (WR_IDLE, WR_OPEN, WR_WRITE, WR_CLOSE);
+    fbOpen     : FB_FileOpen;
+    fbWrite    : FB_FilePuts;
+    fbClose    : FB_FileClose;
+    hFile      : UINT;
+    bBoot      : BOOL;             // TRUE -> sLogDir='' -> boot folder
+    sPath      : STRING(255);
+    sLastDate  : STRING(15);
+    tonRetry   : TON;
+    bBackoff   : BOOL;
+    nFailCount : UDINT;
+    nLastErrId : UDINT;
+    sLastPath  : STRING(255);
+
+    // ---- scratch ----
+    sTs        : STRING(63);
+    sDate      : STRING(15);
+    sFile      : STRING(80);
+    sLine      : STRING(255);
+    sTail      : STRING(2);
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[fbTime();
+
+//------------------------------------------------------------------
+// 1) time-in-state accumulators (1 s resolution)
+//------------------------------------------------------------------
+tonSec(IN := NOT tonSec.Q, PT := T#1S);
+IF tonSec.Q THEN
+    IF MAIN.eState = E_SeqState.eFault THEN
+        nFaultSec := nFaultSec + 1;
+    ELSIF MAIN.eState = E_SeqState.eIdle THEN
+        nIdleSec := nIdleSec + 1;
+    ELSE
+        nRunSec := nRunSec + 1;
+    END_IF
+END_IF
+
+//------------------------------------------------------------------
+// 2) is logging allowed right now?  (master switch + daily window)
+//------------------------------------------------------------------
+tsNow := fbTime.systemTime;
+IF (GVL_Param.nStatsHourFrom = 0) AND (GVL_Param.nStatsHourTo = 0) THEN
+    bInWindow := TRUE;                                   // 24 h logging
+ELSIF GVL_Param.nStatsHourFrom <= GVL_Param.nStatsHourTo THEN
+    bInWindow := (tsNow.wHour >= INT_TO_WORD(GVL_Param.nStatsHourFrom))
+             AND (tsNow.wHour <  INT_TO_WORD(GVL_Param.nStatsHourTo));
+ELSE                                                     // window over midnight
+    bInWindow := (tsNow.wHour >= INT_TO_WORD(GVL_Param.nStatsHourFrom))
+              OR (tsNow.wHour <  INT_TO_WORD(GVL_Param.nStatsHourTo));
+END_IF
+
+//------------------------------------------------------------------
+// 3) adaptive sample trigger (+ immediate sample on any edge)
+//------------------------------------------------------------------
+bActive := (MAIN.eState <> E_SeqState.eIdle) AND (MAIN.eState <> E_SeqState.eFault);
+tPeriod := SEL(bActive, GVL_Param.tStatsIdle, GVL_Param.tStatsRun);
+tonSample(IN := NOT tonSample.Q, PT := tPeriod);
+bDue := tonSample.Q;
+IF (MAIN.eState <> ePrevState) OR (MAIN.bAutoMode <> bPrevAuto) THEN
+    bDue := TRUE;                    // sharp edges on the state timeline
+END_IF
+ePrevState := MAIN.eState;
+bPrevAuto  := MAIN.bAutoMode;
+
+//------------------------------------------------------------------
+// 4) build + queue one CSV line
+//------------------------------------------------------------------
+IF bDue AND bInWindow AND GVL_Param.bStatsEnable AND fbTime.bValid THEN
+
+    // ---- timestamp 'YYYY-MM-DD HH:MM:SS.mmm' (fixed format for Alloy) ----
+    sTs := TO_STRING(tsNow.wYear);
+    sTs := CONCAT(sTs, SEL(tsNow.wMonth  < 10, '-', '-0'));
+    sTs := CONCAT(sTs, TO_STRING(tsNow.wMonth));
+    sTs := CONCAT(sTs, SEL(tsNow.wDay    < 10, '-', '-0'));
+    sTs := CONCAT(sTs, TO_STRING(tsNow.wDay));
+    sDate := sTs;                                        // YYYY-MM-DD
+    sTs := CONCAT(sTs, SEL(tsNow.wHour   < 10, ' ', ' 0'));
+    sTs := CONCAT(sTs, TO_STRING(tsNow.wHour));
+    sTs := CONCAT(sTs, SEL(tsNow.wMinute < 10, ':', ':0'));
+    sTs := CONCAT(sTs, TO_STRING(tsNow.wMinute));
+    sTs := CONCAT(sTs, SEL(tsNow.wSecond < 10, ':', ':0'));
+    sTs := CONCAT(sTs, TO_STRING(tsNow.wSecond));
+    sTs := CONCAT(sTs, '.');
+    IF tsNow.wMilliseconds < 10 THEN
+        sTs := CONCAT(sTs, '00');
+    ELSIF tsNow.wMilliseconds < 100 THEN
+        sTs := CONCAT(sTs, '0');
+    END_IF
+    sTs := CONCAT(sTs, TO_STRING(tsNow.wMilliseconds));
+
+    // ---- day rollover: new file name + one header line ----
+    IF sDate <> sLastDate THEN
+        sLastDate := sDate;
+        sFile := CONCAT('machine_stats_', sDate);
+        sFile := CONCAT(sFile, '.csv');
+        IF GVL_Param.sLogDir = '' THEN
+            bBoot := TRUE;
+            sPath := sFile;                              // TwinCAT boot folder
+        ELSE
+            bBoot := FALSE;
+            sPath := GVL_Param.sLogDir;
+            sTail := RIGHT(sPath, 1);
+            IF (sTail <> '\') AND (sTail <> '/') THEN
+                sPath := CONCAT(sPath, '/');             // '/' works on Windows too
+            END_IF
+            sPath := CONCAT(sPath, sFile);
+        END_IF
+        IF nCount < 16 THEN                              // header line
+            aQ[nTail] := '# ts,state,state_n,mode,level_pct,spx_bar,air_bar,pump_hz,err,run_s,idle_s,fault_s';
+            nTail := (nTail + 1) MOD 16;
+            nCount := nCount + 1;
+        END_IF
+    END_IF
+
+    // ---- the sample itself ----
+    sLine := sTs;
+    sLine := CONCAT(sLine, ',');
+    sLine := CONCAT(sLine, TO_STRING(MAIN.eState));      // 'eIdle' etc.
+    sLine := CONCAT(sLine, ',');
+    sLine := CONCAT(sLine, INT_TO_STRING(TO_INT(MAIN.eState)));  // 0/10/../100
+    sLine := CONCAT(sLine, SEL(MAIN.bAutoMode, ',MAN', ',AUTO'));
+    sLine := CONCAT(sLine, ',');
+    sLine := CONCAT(sLine, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_IO.rSPXLevel), 1, TRUE));
+    sLine := CONCAT(sLine, ',');
+    sLine := CONCAT(sLine, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_IO.rSPXPressure), 2, TRUE));
+    sLine := CONCAT(sLine, ',');
+    sLine := CONCAT(sLine, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_IO.rAirPressure), 2, TRUE));
+    sLine := CONCAT(sLine, ',');
+    sLine := CONCAT(sLine, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_IO.rPumpHz), 1, TRUE));
+    sLine := CONCAT(sLine, ',');
+    sLine := CONCAT(sLine, INT_TO_STRING(MAIN.nErrorCode));
+    sLine := CONCAT(sLine, ',');
+    sLine := CONCAT(sLine, UDINT_TO_STRING(nRunSec));
+    sLine := CONCAT(sLine, ',');
+    sLine := CONCAT(sLine, UDINT_TO_STRING(nIdleSec));
+    sLine := CONCAT(sLine, ',');
+    sLine := CONCAT(sLine, UDINT_TO_STRING(nFaultSec));
+
+    IF nCount < 16 THEN
+        aQ[nTail] := sLine;
+        nTail := (nTail + 1) MOD 16;
+        nCount := nCount + 1;
+    ELSE
+        nDropped := nDropped + 1;                        // disk too slow / stuck
+    END_IF
+END_IF
+
+//------------------------------------------------------------------
+// 5) non-blocking file writer (open -> write all queued -> close)
+//------------------------------------------------------------------
+CASE eWr OF
+    WR_IDLE:
+        tonRetry(IN := bBackoff, PT := T#5S);
+        IF tonRetry.Q THEN
+            bBackoff := FALSE;
+        END_IF
+        IF (nCount > 0) AND NOT bBackoff AND (sPath <> '') THEN
+            sLastPath := sPath;
+            eWr := WR_OPEN;
+        END_IF
+
+    WR_OPEN:
+        fbOpen(sNetId   := '',
+               sPathName := sPath,
+               nMode    := FOPEN_MODEAPPEND OR FOPEN_MODETEXT,
+               ePath    := SEL(bBoot, PATH_GENERIC, PATH_BOOTPATH),
+               tTimeout := T#3S,
+               bExecute := TRUE);
+        IF NOT fbOpen.bBusy THEN
+            fbOpen(bExecute := FALSE);
+            IF fbOpen.bError THEN
+                nLastErrId := fbOpen.nErrId;
+                nFailCount := nFailCount + 1;
+                bBackoff   := TRUE;
+                eWr := WR_IDLE;
+            ELSE
+                hFile := fbOpen.hFile;
+                eWr := WR_WRITE;
+            END_IF
+        END_IF
+
+    WR_WRITE:
+        fbWrite(sNetId   := '',
+                hFile    := hFile,
+                sLine    := CONCAT(aQ[nHead], '$N'),
+                tTimeout := T#3S,
+                bExecute := TRUE);
+        IF NOT fbWrite.bBusy THEN
+            fbWrite(bExecute := FALSE);
+            IF fbWrite.bError THEN
+                nLastErrId := fbWrite.nErrId;
+                nFailCount := nFailCount + 1;
+                bBackoff   := TRUE;
+                eWr := WR_CLOSE;
+            ELSE
+                nHead  := (nHead + 1) MOD 16;
+                nCount := nCount - 1;
+                IF nCount = 0 THEN
+                    eWr := WR_CLOSE;
+                END_IF
+                // else: stay here, next call re-triggers for the next line
+            END_IF
+        END_IF
+
+    WR_CLOSE:
+        fbClose(sNetId   := '',
+                hFile    := hFile,
+                tTimeout := T#3S,
+                bExecute := TRUE);
+        IF NOT fbClose.bBusy THEN
+            fbClose(bExecute := FALSE);
+            IF fbClose.bError THEN
+                nLastErrId := fbClose.nErrId;
+                nFailCount := nFailCount + 1;
+            END_IF
+            hFile := 0;
+            eWr := WR_IDLE;
+        END_IF
+END_CASE]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

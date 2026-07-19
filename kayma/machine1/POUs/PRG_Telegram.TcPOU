@@ -1,0 +1,162 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="PRG_Telegram" Id="{4b322a1a-a8b3-42b3-b859-6f07dc0528d3}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM PRG_Telegram
+//==================================================================
+// TELEGRAM FAULT NOTIFIER   (TF6760 / Tc3_IotBase)
+//   Sends one message to a Telegram chat on every fault entry
+//   (rising edge of MAIN.bError). Fire-and-forget: a failed send is
+//   counted and dropped - the machine is never blocked.
+//
+//   Must be called AFTER PRG_Spray() in MAIN, so that
+//   PRG_Spray.sErrorText is already updated on the fault scan.
+//
+//   Setup:
+//     1. Telegram @BotFather -> /newbot -> paste the token into
+//        GVL_Secrets.TELEGRAM_BOT_TOKEN (file is git-ignored).
+//     2. Send any message to the bot, then open in a browser:
+//          https://api.telegram.org/bot<TOKEN>/getUpdates
+//        and copy  "chat":{"id":...}  into GVL_Secrets.TELEGRAM_CHAT_ID.
+//        (For a group: add the bot to the group; the id is negative.)
+//     3. License TF6760 on the target (7-day trial works for tests).
+//     4. The target needs internet + DNS (ping api.telegram.org).
+//==================================================================
+VAR
+    // ---- config (built on first scan from GVL_Secrets) ----
+    sUri      : STRING(255);                  // '/bot<TOKEN>/sendMessage'
+    sChatId   : STRING(31);                   // negative for group chats
+    tCooldown : TIME := T#30S;                // min. spacing between messages
+
+    // ---- HTTP client / request (Tc3_IotBase) ----
+    fbClient  : FB_IotHttpClient := (sHostName := 'api.telegram.org',
+                                     nHostPort := 443,
+                                     bKeepAlive := FALSE);
+    fbRequest : FB_IotHttpRequest;
+    bTlsInit  : BOOL;                         // TLS + URI set before first Execute()
+
+    // ---- event detection ----
+    rtFault   : R_TRIG;                       // fault entry (MAIN.bError)
+    tonCool   : TON;
+    bCool     : BOOL;
+
+    // ---- timestamp ----
+    fbTime    : FB_LocalSystemTime := (bEnable := TRUE, dwCycle := 1);
+
+    // ---- message buffers ----
+    sText     : STRING(255);                  // human text (ASCII only!)
+    sPending  : STRING(255);                  // one-slot queue (JSON body)
+    sBody     : STRING(255);                  // JSON body currently sending
+    eStep     : (IDLE, SEND, WAIT_RESPONSE);
+    tonSendTo : TON;                          // give-up timer for SEND
+
+    // ---- diagnostics (watch online if no message arrives) ----
+    nLastStatus : UINT;                       // last HTTP status (200 = OK)
+    nFailCount  : UINT;                       // messages lost to errors
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[//==================================================================
+// First scan: build the URI from the (git-ignored) secrets GVL and
+// configure TLS. Both must happen before the first Execute() call.
+//==================================================================
+IF NOT bTlsInit THEN
+    bTlsInit := TRUE;
+
+    sUri := CONCAT('/bot', GVL_Secrets.TELEGRAM_BOT_TOKEN);
+    sUri := CONCAT(sUri, '/sendMessage');
+    sChatId := GVL_Secrets.TELEGRAM_CHAT_ID;
+
+    // Quick start: skip server-certificate verification.
+    // For production, put a CA bundle (.pem) on the target and use:
+    //   fbClient.stTLS.sCA := 'C:\TwinCAT\3.1\Boot\ca-bundle.pem';
+    fbClient.stTLS.bNoServerCertCheck := TRUE;
+END_IF
+
+fbClient.Execute();      // background comms - MUST run every scan
+fbTime();
+
+//==================================================================
+// Fault edge + cooldown  (same pattern as PRG_FileLogger)
+//==================================================================
+rtFault(CLK := MAIN.bError);
+
+tonCool(IN := bCool, PT := tCooldown);
+IF tonCool.Q THEN
+    bCool := FALSE;
+END_IF
+
+IF rtFault.Q AND NOT bCool THEN
+    bCool := TRUE;
+
+    // Build the message NOW, so text and values are from the moment of
+    // the fault. PRG_Spray.sErrorText is current: MAIN calls PRG_Spray
+    // before this program in the same scan.
+    sText := 'SPRAY FAULT ';
+    sText := CONCAT(sText, INT_TO_STRING(MAIN.nErrorCode));
+    sText := CONCAT(sText, ': ');
+    sText := CONCAT(sText, PRG_Spray.sErrorText);
+    sText := CONCAT(sText, '\nLevel ');           // '\n' = literal chars
+    sText := CONCAT(sText, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_IO.rSPXLevel), 1, TRUE));
+    sText := CONCAT(sText, ' % / SPX ');
+    sText := CONCAT(sText, LREAL_TO_FMTSTR(REAL_TO_LREAL(GVL_IO.rSPXPressure), 2, TRUE));
+    sText := CONCAT(sText, ' bar');
+    IF fbTime.bValid THEN
+        sText := CONCAT(sText, '\n');
+        sText := CONCAT(sText, SYSTEMTIME_TO_STRING(fbTime.systemTime));
+    END_IF
+
+    // JSON wrapper. The '\n' above is backslash+n (two characters) -
+    // JSON turns that into a real newline in the Telegram message.
+    // Keep sText plain ASCII without quotes/backslashes, or escape them.
+    sPending := '{"chat_id":"';
+    sPending := CONCAT(sPending, sChatId);
+    sPending := CONCAT(sPending, '","text":"');
+    sPending := CONCAT(sPending, sText);
+    sPending := CONCAT(sPending, '"}');
+    // NOTE: a newer fault overwrites an unsent one (one-slot queue).
+END_IF
+
+//==================================================================
+// Send state machine: hand over -> wait for the response -> idle.
+//==================================================================
+CASE eStep OF
+
+    IDLE:
+        IF sPending <> '' THEN
+            sBody    := sPending;
+            sPending := '';
+            eStep    := SEND;
+        END_IF
+
+    SEND:
+        // Retry the handover for up to 10 s (client may still be
+        // configuring right after boot), then drop the message.
+        tonSendTo(IN := TRUE, PT := T#10S);
+        fbRequest.sContentType := 'application/json';
+        IF fbRequest.SendRequest(sUri         := sUri,
+                                 fbClient     := fbClient,
+                                 eRequestType := ETcIotHttpRequestType.HTTP_POST,
+                                 pContent     := ADR(sBody),
+                                 nContentSize := TO_UDINT(LEN(sBody)),
+                                 fbHeader     := 0) THEN
+            tonSendTo(IN := FALSE);
+            eStep := WAIT_RESPONSE;
+        ELSIF tonSendTo.Q THEN
+            tonSendTo(IN := FALSE);
+            nFailCount := nFailCount + 1;     // never block the machine
+            eStep := IDLE;
+        END_IF
+
+    WAIT_RESPONSE:
+        // bBusy TRUE->FALSE = response received (or the request failed).
+        IF NOT fbRequest.bBusy THEN
+            nLastStatus := fbRequest.nStatusCode;
+            IF fbRequest.bError OR (fbRequest.nStatusCode <> 200) THEN
+                nFailCount := nFailCount + 1;
+            END_IF
+            eStep := IDLE;
+        END_IF
+
+END_CASE]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

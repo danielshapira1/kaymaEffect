@@ -128,8 +128,8 @@ IF bSimLevelActive THEN
         END_IF
     ELSE
         fSimLevel := fSimLevel - fSimRate * fDt;
-        IF fSimLevel <= 12.0 THEN
-            fSimLevel := 12.0;
+        IF fSimLevel <= 21.0 THEN
+            fSimLevel := 21.0;
             bSimUp    := TRUE;       // bottom reached -> fill
         END_IF
     END_IF

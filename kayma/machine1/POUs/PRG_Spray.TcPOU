@@ -30,7 +30,7 @@ VAR_OUTPUT
     bManSPXValve    : BOOL;   // manual: SPX valve         (HMI toggle)
     bManPistonOpen  : BOOL;   // manual: piston OPEN  sol. (HMI toggle)
     bManPistonClose : BOOL;   // manual: piston CLOSE sol. (HMI toggle)
-    rManPumpHz      : REAL := 15.0;   // manual: gear-pump speed setpoint [Hz]
+    rManPumpHz      : REAL := 15.0;   // manual/clean pump speed [Hz] - mirrors GVL_Param.rPumpSpeedBase every scan
 
     // ---- clean mode (read by MAIN) ----
     bCleanActive    : BOOL;   // TRUE = clean sequence running: MAIN skips the
@@ -217,7 +217,14 @@ rAirPressure := GVL_IO.rAirPressure;
 //   Live only when AUTO is off and the sequence is idle. Buttons
 //   toggle each actuator; MAIN applies bMan* while bManualActive.
 //   While CLEAN MODE runs, the clean sequence (6b) owns the pump.
+//   The pump follows the 'Pump speed' machine parameter
+//   (GVL_Param.rPumpSpeedBase), so an Apply on the Params page takes
+//   effect immediately here and in clean mode (6b).
 //==================================================================
+// mirror the machine parameter every scan - rManPumpHz has no HMI
+// field of its own; the Params page is the single place to set it
+rManPumpHz := GVL_Param.rPumpSpeedBase;
+
 bManualActive := (NOT MAIN.bAutoMode) AND (MAIN.eState = E_SeqState.eIdle);
 
 IF NOT bManualActive THEN

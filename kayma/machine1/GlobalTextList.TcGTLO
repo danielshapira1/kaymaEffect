@@ -36,6 +36,11 @@
               <l n="LanguageTexts" t="ArrayList" />
             </o>
             <o>
+              <v n="TextID">"116"</v>
+              <v n="TextDefault">"Air: %.2f bar"</v>
+              <l n="LanguageTexts" t="ArrayList" />
+            </o>
+            <o>
               <v n="TextID">"911"</v>
               <v n="TextDefault">"apply"</v>
               <l n="LanguageTexts" t="ArrayList" />
@@ -161,6 +166,11 @@
               <l n="LanguageTexts" t="ArrayList" />
             </o>
             <o>
+              <v n="TextID">"775"</v>
+              <v n="TextDefault">"RESET DEFAULTS"</v>
+              <l n="LanguageTexts" t="ArrayList" />
+            </o>
+            <o>
               <v n="TextID">"450"</v>
               <v n="TextDefault">"s"</v>
               <l n="LanguageTexts" t="ArrayList" />
@@ -193,6 +203,11 @@
             <o>
               <v n="TextID">"488"</v>
               <v n="TextDefault">"SPX valve"</v>
+              <l n="LanguageTexts" t="ArrayList" />
+            </o>
+            <o>
+              <v n="TextID">"925"</v>
+              <v n="TextDefault">"SPX: %.2f bar"</v>
               <l n="LanguageTexts" t="ArrayList" />
             </o>
             <o>

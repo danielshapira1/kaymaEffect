@@ -28,7 +28,40 @@ VAR_GLOBAL PERSISTENT
     rLevelLow          : REAL := 20.0;     // SPX tank: warn below [%]
     rLevelEmpty        : REAL := 5.0;      // SPX tank: below -> stop pump & block mother release [%]
     rCircPressTol      : REAL := 0.5;      // spray-avg vs circulation-avg > this -> "adjust" message
+
+    // ===== logging =====
+    // Directory for the event log file (PRG_FileLogger).
+    //   ''  -> TwinCAT boot folder of the TARGET (portable default:
+    //          Windows C:\TwinCAT\3.1\Boot\ , BSD/Linux /usr/local/etc/TwinCAT/3.1/Boot/)
+    //   'C:\kayma\machine1'          -> Windows dev PC
+    //   '/home/Administrator/logs'   -> Linux/BSD PLC (folder must exist & be writable
+    //                                   by the TwinCAT runtime user!)
+    // PERSISTENT: set once per machine, survives reboots. Takes effect on the
+    // next logged event - no restart needed.
+    sLogDir            : STRING(255) := '';
+
+    // TRUE  -> every sequence state transition is logged as INFO
+    //          (~4 extra lines per spray cycle; great for commissioning)
+    // FALSE -> only cycle start/complete, faults, resets, warnings
+    bLogStateChanges   : BOOL := TRUE;
+	bStatsEnable   : BOOL := TRUE;   // master switch
+    tStatsRun      : TIME := T#1S;   // sample period while cycle active
+    tStatsIdle     : TIME := T#2M;   // keep-alive period idle/fault
+    nStatsHourFrom : INT  := 0;      // daily window; From=To=0 -> 24h
+    nStatsHourTo   : INT  := 0;      // e.g. 6 & 22 -> log 06:00-21:59
 END_VAR
-]]></Declaration>
+
+VAR_GLOBAL CONSTANT
+    // ===== factory defaults (RESET button on the params page) =====
+    // One authoritative home for the default machine parameters.
+    // If you retune the machine, change the defaults HERE (they should
+    // normally mirror the init values of the persistent block above).
+    cDefDewaterTime    : TIME := T#4S;      // T1
+    cDefValveMaxTime   : TIME := T#500MS;   // T2 & T6
+    cDefSprayTime      : TIME := T#3S;      // T3 & T4
+    cDefSPXDewaterTime : TIME := T#10S;     // T5
+    cDefPressTarget    : REAL := 1.7;       // [bar]
+    cDefPumpSpeed      : REAL := 15.0;      // [Hz]
+END_VAR]]></Declaration>
   </GVL>
 </TcPlcObject>

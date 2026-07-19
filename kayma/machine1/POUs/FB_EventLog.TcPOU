@@ -1,0 +1,272 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="FB_EventLog" Id="{0cf5812a-e705-4a47-8f58-4ab2c1ebb804}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_EventLog
+//==================================================================
+// CENTRAL EVENT LOGGER
+//   Info() / Warn() / Error()  -> tagged, timestamped line -> queue
+//   FB body (call once per scan) -> drains the queue to the file
+//
+//   Line format (tag FIRST so the eye can scan the left column):
+//     [.]  2026-07-08-14:03:21.457  AUTO armed by operator
+//     [!]  2026-07-08-14:05:02.113  SPX level low: 18.4 % (limit 20.0 %)
+//     [X]  2026-07-08-14:07:44.902  FAULT 20: SPX valve stuck ...
+//        [.] = INFO    [!] = WARN    [X] = ERROR
+//   grep-friendly:  grep '^\[X\]' machine_events_2026-07.log
+//
+//   MONTHLY ROTATION: the file name is built per write as
+//     <sBaseName>_YYYY-MM.log      e.g. machine_events_2026-07.log
+//   so a new month automatically starts a new file (old months are
+//   kept - clean them up manually or via cron/scheduled task).
+//   On every PLC boot AND on each month rollover a legend/separator
+//   header line is written first.
+//
+//   File location comes from GVL_Param.sLogDir:
+//     ''  -> target's TwinCAT boot folder (portable default:
+//            Windows C:\TwinCAT\3.1\Boot\ , BSD/Linux /usr/local/etc/TwinCAT/3.1/Boot\)
+//     any full directory otherwise (per-machine, persistent).
+//
+//   Philosophy: NEVER block the machine. File error -> line dropped,
+//   counted in nFailCount. Queue full -> line dropped, counted in
+//   nDropped. Watch the outputs online if the file stays empty.
+//
+//   NOTE: call Info/Warn/Error only from the SAME PLC task that calls
+//   the FB body (no locking inside).
+//==================================================================
+VAR_INPUT
+    sBaseName : STRING(60) := 'machine_events';   // -> <base>_YYYY-MM.log; dir = GVL_Param.sLogDir
+END_VAR
+VAR_OUTPUT
+    bTimeValid : BOOL;            // local clock ready (gate one-shot boot messages on this)
+    nLastErrId : UDINT;           // last ADS error id from open/write
+    nFailCount : UINT;            // lines lost to file errors
+    nDropped   : UINT;            // lines lost to queue overflow
+    sLastPath  : STRING(255);     // last path handed to FB_FileOpen (1st thing to check on Linux)
+END_VAR
+VAR
+    // ---- timestamp ----
+    fbTime  : FB_LocalSystemTime := (bEnable := TRUE, dwCycle := 1);
+
+    // ---- ring buffer ----
+    aQueue  : ARRAY[0..cQLAST] OF STRING(255);
+    nHead   : INT;                // next free slot
+    nTail   : INT;                // oldest queued line
+    nCount  : INT;                // lines currently queued
+
+    // ---- file access (Tc2_System) ----
+    fbOpen  : FB_FileOpen;
+    fbWrite : FB_FileWrite;
+    fbClose : FB_FileClose;
+    hFile   : UINT;
+    eStep   : (IDLE, OPEN_FILE, WRITE_HDR, WRITE_LINE, CLOSE_FILE);
+    sLine   : STRING(255);        // line currently being written
+    sHdr    : STRING(120);        // legend/separator header
+
+    // ---- monthly file name ----
+    sCurFile  : STRING(80);       // name for the current month
+    sLastFile : STRING(80);       // last name actually opened (header trigger)
+    sMon      : STRING(4);
+
+    // ---- path building ----
+    sFullPath : STRING(255);
+    ePathMode : E_OpenPath;       // PATH_BOOTPATH (portable) or PATH_GENERIC (explicit dir)
+    sSep      : STRING(1);
+END_VAR
+VAR CONSTANT
+    cQSIZE : INT := 16;
+    cQLAST : INT := 15;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// ---- time base (cyclic) ----
+fbTime();
+bTimeValid := fbTime.bValid;
+
+// ---- drain queue: open (append) -> [header] -> write burst -> close ----
+CASE eStep OF
+
+    IDLE:
+        IF nCount > 0 THEN
+            sLine  := aQueue[nTail];
+            nTail  := (nTail + 1) MOD cQSIZE;
+            nCount := nCount - 1;
+            eStep  := OPEN_FILE;
+        END_IF
+
+    OPEN_FILE:
+        // ---- monthly file name: <base>_YYYY-MM.log ----
+        IF fbTime.bValid THEN
+            sMon := WORD_TO_STRING(fbTime.systemTime.wMonth);
+            IF fbTime.systemTime.wMonth < 10 THEN
+                sMon := CONCAT('0', sMon);
+            END_IF
+            sCurFile := CONCAT(sBaseName, '_');
+            sCurFile := CONCAT(sCurFile, WORD_TO_STRING(fbTime.systemTime.wYear));
+            sCurFile := CONCAT(sCurFile, '-');
+            sCurFile := CONCAT(sCurFile, sMon);
+            sCurFile := CONCAT(sCurFile, '.log');
+        ELSE
+            sCurFile := CONCAT(sBaseName, '.log');   // clock not up yet (rare)
+        END_IF
+
+        // ---- directory: GVL_Param.sLogDir ('' = portable boot folder) ----
+        // Resolved on every attempt -> sLogDir changes take effect on
+        // the next event, no restart needed.
+        IF GVL_Param.sLogDir = '' THEN
+            sFullPath := sCurFile;        // portable default: target's boot folder
+            ePathMode := PATH_BOOTPATH;
+        ELSE
+            sFullPath := GVL_Param.sLogDir;
+            // append a trailing separator matching the path style if missing
+            sSep := RIGHT(sFullPath, 1);
+            IF sSep <> '/' AND sSep <> '\' THEN
+                IF FIND(sFullPath, '/') > 0 THEN
+                    sFullPath := CONCAT(sFullPath, '/');   // Linux-style
+                ELSE
+                    sFullPath := CONCAT(sFullPath, '\');   // Windows-style
+                END_IF
+            END_IF
+            sFullPath := CONCAT(sFullPath, sCurFile);
+            ePathMode := PATH_GENERIC;
+        END_IF
+        sLastPath := sFullPath;
+
+        fbOpen(sNetId    := '',
+               sPathName := sFullPath,
+               nMode     := FOPEN_MODEAPPEND OR FOPEN_MODETEXT,
+               ePath     := ePathMode,
+               tTimeout  := T#3S,
+               bExecute  := TRUE);
+        IF NOT fbOpen.bBusy THEN
+            fbOpen(bExecute := FALSE);
+            IF fbOpen.bError THEN
+                nLastErrId := fbOpen.nErrId;
+                nFailCount := nFailCount + 1;
+                eStep := IDLE;            // drop this line - never block the machine
+            ELSE
+                hFile := fbOpen.hFile;
+                IF sCurFile <> sLastFile THEN
+                    sLastFile := sCurFile;   // first write after boot, or month rollover
+                    eStep := WRITE_HDR;      // -> drop the legend/separator first
+                ELSE
+                    eStep := WRITE_LINE;
+                END_IF
+            END_IF
+        END_IF
+
+    WRITE_HDR:
+        sHdr := '==== log opened (PLC boot / month rollover) | legend: [.]=INFO  [!]=WARN  [X]=ERROR ====$N';
+        fbWrite(sNetId     := '',
+                hFile      := hFile,
+                pWriteBuff := ADR(sHdr),
+                cbWriteLen := TO_UDINT(LEN(sHdr)),
+                tTimeout   := T#3S,
+                bExecute   := TRUE);
+        IF NOT fbWrite.bBusy THEN
+            fbWrite(bExecute := FALSE);
+            IF fbWrite.bError THEN
+                nLastErrId := fbWrite.nErrId;
+                nFailCount := nFailCount + 1;
+            END_IF
+            eStep := WRITE_LINE;          // header failure never blocks the real line
+        END_IF
+
+    WRITE_LINE:
+        fbWrite(sNetId     := '',
+                hFile      := hFile,
+                pWriteBuff := ADR(sLine),
+                cbWriteLen := TO_UDINT(LEN(sLine)),
+                tTimeout   := T#3S,
+                bExecute   := TRUE);
+        IF NOT fbWrite.bBusy THEN
+            fbWrite(bExecute := FALSE);
+            IF fbWrite.bError THEN
+                nLastErrId := fbWrite.nErrId;
+                nFailCount := nFailCount + 1;
+                eStep := CLOSE_FILE;      // always close after an error
+            ELSIF nCount > 0 THEN
+                // burst: everything queued goes out in ONE open/close session
+                sLine  := aQueue[nTail];
+                nTail  := (nTail + 1) MOD cQSIZE;
+                nCount := nCount - 1;     // stay in WRITE_LINE -> re-triggers next scan
+            ELSE
+                eStep := CLOSE_FILE;
+            END_IF
+        END_IF
+
+    CLOSE_FILE:
+        fbClose(sNetId   := '',
+                hFile    := hFile,
+                tTimeout := T#3S,
+                bExecute := TRUE);
+        IF NOT fbClose.bBusy THEN
+            fbClose(bExecute := FALSE);
+            hFile := 0;
+            eStep := IDLE;
+        END_IF
+
+END_CASE]]></ST>
+    </Implementation>
+    <Method Name="Error" Id="{105b758d-acef-44ed-a59b-ab23a2eb8ab5}">
+      <Declaration><![CDATA[METHOD Error : BOOL
+VAR_INPUT
+    sMsg : STRING(255);
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[Error := Push('[X]  ', sMsg);]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="Info" Id="{4879e643-de6c-44ff-8237-f1154591b53b}">
+      <Declaration><![CDATA[// INFO [.] = normal life of the machine (boot, mode, cycles, params, manual).
+METHOD Info : BOOL   // TRUE = queued, FALSE = dropped (queue full)
+VAR_INPUT
+    sMsg : STRING(255);
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[Info := Push('[.]  ', sMsg);]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="Push" Id="{27117654-753c-4c81-8bd3-80d9dab8b36e}">
+      <Declaration><![CDATA[METHOD PRIVATE Push : BOOL
+VAR_INPUT
+    sTag : STRING(5);
+    sMsg : STRING(255);
+END_VAR
+VAR
+    sLn : STRING(255);
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[sLn := sTag;
+// timestamp (placeholder during the first scans, before the clock is up)
+IF fbTime.bValid THEN
+    sLn := CONCAT(sLn, SYSTEMTIME_TO_STRING(fbTime.systemTime));
+ELSE
+    sLn := CONCAT(sLn, '????-??-??-??:??:??.???');
+END_IF
+sLn := CONCAT(sLn, '  ');
+sLn := CONCAT(sLn, sMsg);
+sLn := CONCAT(sLn, '$N');          // CONCAT truncates safely at 255 chars
+
+IF nCount < cQSIZE THEN
+    aQueue[nHead] := sLn;
+    nHead  := (nHead + 1) MOD cQSIZE;
+    nCount := nCount + 1;
+    Push   := TRUE;
+ELSE
+    nDropped := nDropped + 1;      // queue full - drop, never block
+    Push     := FALSE;
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="Warn" Id="{6d08c307-1162-44da-9354-441aecee97b4}">
+      <Declaration><![CDATA[// WARN [!] = process warnings & rejected operations (machine keeps running).
+METHOD Warn : BOOL   // TRUE = queued, FALSE = dropped (queue full)
+VAR_INPUT
+    sMsg : STRING(255);
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[Warn := Push('[!]  ', sMsg);]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

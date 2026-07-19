@@ -327,7 +327,8 @@ END_IF
 PRG_Process();   // level monitoring, pump P-control, circulation check
 PRG_Spray();     // Spray System screen      (page 0)
 PRG_Params();    // Machine Parameters screen (page 1)
-PRG_FileLogger(); // Logger for the machine]]></ST>
+PRG_FileLogger(); // Logger for the machine
+PRG_Telegram();  // Telegram fault notifier (TF6760)]]></ST>
     </Implementation>
   </POU>
 </TcPlcObject>
