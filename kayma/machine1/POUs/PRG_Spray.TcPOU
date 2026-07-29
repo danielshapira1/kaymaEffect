@@ -40,6 +40,18 @@ VAR_OUTPUT
 END_VAR
 
 VAR
+	
+ 	// ---- readout text colours (AARRGGBB) ----
+    //   black = normal, amber = warning, red = lockout. Driven from the flags
+    //   PRG_Process/MAIN already evaluate, so the colour on screen can never
+    //   disagree with the fault code or the log file.
+    cSPXPress   : DWORD;   // SPX pressure field. Amber while GVL_Process.bWarnBadSPX,
+                           // i.e. the last cycle's T3/T4 average sat further than
+                           // rSPXPressTol from rSPXPressureTarget. Latched per cycle,
+                           // so it describes the last spray, not the live number.
+    cLevel      : DWORD;   // SPX level field. Amber below rLevelLow or above
+                           // rLevelHigh, red below rLevelEmpty (bLevelEmpty, which
+                           // also stops the pump and blocks the mother release).
     // ---- mimic colours (AARRGGBB) ----
     cAirValve   : DWORD;
     cSPXValve   : DWORD;
@@ -87,6 +99,13 @@ VAR
     bCleanPrev     : BOOL;   // clean-active on the previous scan (exit edge)
 
     i : INT;
+	
+	 // ---- water animation (spray strokes + clean flush) ----
+    bWaterFlow : BOOL;                   // TRUE = stream visible
+    abDrop     : ARRAY[0..3] OF BOOL;    // one flag per droplet, top -> bottom
+    nDropIdx   : INT;                    // chaser position
+    tonDrop    : TON;
+    j          : INT;
 END_VAR
 
 VAR CONSTANT
@@ -94,6 +113,7 @@ VAR CONSTANT
     cGREY   : DWORD := 16#FF8A8F98;   // closed
     cRED    : DWORD := 16#FFE5484D;   // in transit / fault
     cYELLOW : DWORD := 16#FFF2C94C;   // manual
+	cBLACK  : DWORD := 16#FF000000;
 
     // ---- clean-mode steps ----
     nCLEAN_OFF       : INT := 0;   // clean mode not active
@@ -107,6 +127,10 @@ VAR CONSTANT
     rCLEAN_EMPTY : REAL := 0.5;    // 'tank is 0' threshold [%]
     rCLEAN_FILL  : REAL := 20.0;   // refill minimum [%] - flush allowed at or above this
     tFLUSH_DELAY : TIME := T#20S;  // wait before the SPX valve auto-opens
+	
+	nDROP_COUNT : INT  := 6;         // droplets in the column (= abDrop size)
+    nDROP_LIT   : INT  := 3;         // lit at once = visible stream length
+    tDROP_STEP  : TIME := T#100MS;   // time per step -> fall speed
 END_VAR]]></Declaration>
     <Implementation>
       <ST><![CDATA[//==================================================================
@@ -192,6 +216,28 @@ bMoldLamp := GVL_IO.bMoldAtSprayHigh;
 // spray marks: piston off BOTH ends AND SPX + Air valves open
 bSprayMarks := (NOT GVL_IO.bPistonOpen) AND (NOT GVL_IO.bPistonClosed)
             AND GVL_IO.bSPXValve AND GVL_IO.bAirValve;
+			
+//==================================================================
+// 3b) WATER ANIMATION under the piston
+//   Visible during the spray strokes (steps 20 / 30) and while the
+//   clean sequence is flushing the pipes. nDropY repeats 0..spacing;
+//   droplets placed one spacing apart read as a continuous stream.
+//==================================================================
+bWaterFlow := (MAIN.eState = E_SeqState.eSprayOpen)     // step 20
+           OR (MAIN.eState = E_SeqState.eSprayClose)    // step 30
+           OR (nCleanStep = nCLEAN_FLUSH);              // clean-mode flush
+
+tonDrop(IN := bWaterFlow AND NOT tonDrop.Q, PT := tDROP_STEP);
+IF NOT bWaterFlow THEN
+    nDropIdx := 0;                       // always restart at the top
+ELSIF tonDrop.Q THEN
+    nDropIdx := (nDropIdx + 1) MOD nDROP_COUNT;
+END_IF
+
+FOR j := 0 TO nDROP_COUNT - 1 DO
+    abDrop[j] := bWaterFlow
+             AND (((j - nDropIdx + nDROP_COUNT) MOD nDROP_COUNT) < nDROP_LIT);
+END_FOR
 
 //==================================================================
 // 4) MODE COLOUR / TEXT   manual = yellow, auto = green, fault = red
@@ -202,6 +248,23 @@ ELSIF MAIN.bAutoMode THEN
     cModeColor := cGREEN;  sModeText := 'AUTO';
 ELSE
     cModeColor := cYELLOW; sModeText := 'MANUAL';
+END_IF
+
+//------------------------------------------------------------------
+// Readout colours - reuse the flags PRG_Process/MAIN already evaluate
+//------------------------------------------------------------------
+IF GVL_Process.bLevelEmpty THEN
+    cLevel := cRED;                       // < rLevelEmpty -> pump stop / lockout
+ELSIF GVL_Process.bWarnLevelLow OR GVL_Process.bWarnLevelHigh THEN
+    cLevel := cYELLOW;
+ELSE
+    cLevel := cBLACK;
+END_IF
+
+IF GVL_Process.bWarnBadSPX THEN
+    cSPXPress := cYELLOW;                 // last cycle's T3/T4 average off target
+ELSE
+    cSPXPress := cBLACK;
 END_IF
 
 //==================================================================
