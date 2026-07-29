@@ -30,6 +30,9 @@ VAR_OUTPUT
     bManSPXValve    : BOOL;   // manual: SPX valve         (HMI toggle)
     bManPistonOpen  : BOOL;   // manual: piston OPEN  sol. (HMI toggle)
     bManPistonClose : BOOL;   // manual: piston CLOSE sol. (HMI toggle)
+    bManPump        : BOOL;   // manual: gear pump RUN     (HMI toggle).
+                              // FALSE at every manual entry - the pump only
+                              // turns when the operator asks for it.
     rManPumpHz      : REAL := 15.0;   // manual/clean pump speed [Hz] - mirrors GVL_Param.rPumpSpeedBase every scan
 
     // ---- clean mode (read by MAIN) ----
@@ -58,6 +61,7 @@ VAR
     cCircValve  : DWORD;
     cPistonOpen : DWORD;
     cPistonClose: DWORD;
+    cPump       : DWORD;   // gear-pump circle: green = turning, grey = 0 Hz
     cModeColor  : DWORD;
 
     // ---- lamps / flags ----
@@ -122,6 +126,11 @@ VAR CONSTANT
     cYELLOW : DWORD := 16#FFF2C94C;   // manual / simulated values
 	cBLACK  : DWORD := 16#FF000000;
 	cWHITE  : DWORD := 16#FFFFFFFF;   // default button fill (matches the style)
+
+    // Below this the pump feedback counts as stopped [Hz]. Deadband for
+    // analog noise; SIM_Plant.rSimPumpZero must not sit above it, or a
+    // simulated stop would leave the circle green.
+    rPUMP_RUN_MIN : REAL := 0.5;
 
     // ---- clean-mode steps ----
     nCLEAN_OFF       : INT := 0;   // clean mode not active
@@ -221,6 +230,11 @@ IF GVL_IO.bPistonClosed THEN cPistonClose := cGREEN; ELSE cPistonClose := cGREY;
 
 bMoldLamp := GVL_IO.bMoldAtSprayHigh;
 
+// Gear pump - by the VFD speed FEEDBACK, not the setpoint: a command
+// of 15 Hz into a tripped or unwired drive must not paint the pump
+// green. Deadband because a 4-20 mA channel never reads exactly zero.
+cPump := SEL(GVL_IO.rPumpHzFb > rPUMP_RUN_MIN, cGREY, cGREEN);
+
 // spray marks: piston off BOTH ends AND SPX + Air valves open
 bSprayMarks := (NOT GVL_IO.bPistonOpen) AND (NOT GVL_IO.bPistonClosed)
             AND GVL_IO.bSPXValve AND GVL_IO.bAirValve;
@@ -296,7 +310,7 @@ END_IF
 //==================================================================
 // 5) LIVE READOUTS
 //==================================================================
-rPumpHz      := GVL_IO.rPumpHz;
+rPumpHz      := GVL_IO.rPumpHzFb;     // measured speed - the screen shows this
 rSPXLevel    := GVL_IO.rSPXLevel;
 rSPXPressure := GVL_IO.rSPXPressure;
 rAirPressure := GVL_IO.rAirPressure;
@@ -321,12 +335,23 @@ IF NOT bManualActive THEN
     bManSPXValve    := FALSE;
     bManPistonOpen  := FALSE;
     bManPistonClose := FALSE;
+    bManPump        := FALSE;   // leaving manual always drops the pump request
 ELSIF nCleanStep = nCLEAN_OFF THEN
-    // manual pump setpoint drives the VFD directly (empty still wins)
+    // Manual pump: stopped until the operator presses 'Run Pump'.
+    //   It used to free-run at rManPumpHz for as long as the machine sat
+    //   idle in manual, so merely selecting manual started the pump. Now
+    //   the request is explicit and one press stops it again.
+    //   An empty tank clears the request outright rather than just
+    //   forcing 0 Hz, so the pump cannot restart by itself when the level
+    //   creeps back over the threshold - the operator presses again.
     IF GVL_Process.bLevelEmpty THEN
-        GVL_IO.rPumpHz := 0.0;
-    ELSE
+        bManPump := FALSE;
+    END_IF
+
+    IF bManPump THEN
         GVL_IO.rPumpHz := rManPumpHz;
+    ELSE
+        GVL_IO.rPumpHz := 0.0;
     END_IF
 END_IF
 
@@ -370,6 +395,15 @@ IF (nCleanStep <> nCLEAN_OFF) AND NOT bManualActive THEN
 END_IF
 
 bCleanActive := (nCleanStep <> nCLEAN_OFF);
+
+// Clean mode owns the pump outright, so a manual run request cannot
+// survive it. Held clear every scan rather than cleared on the exit
+// edge: clean mode has several exits (Stop Clean, leaving manual, and
+// the dry-tank self-exit), and all of them must leave the pump stopped
+// until the operator presses Run Pump again.
+IF bCleanActive THEN
+    bManPump := FALSE;
+END_IF
 
 // 0.5 s blink generator for the flashing prompt buttons
 tonBlink(IN := NOT tonBlink.Q, PT := T#500MS);

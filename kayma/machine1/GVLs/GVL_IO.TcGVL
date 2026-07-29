@@ -30,6 +30,11 @@ VAR_GLOBAL
     rSPXLevel        : REAL;   // SPX tank level  [%]               // AT %I* (scaled)
     rSPXPressure     : REAL;   // SPX pressure    [bar]             // AT %I* (scaled)
     rAirPressure     : REAL;   // Air pressure    [bar]             // AT %I* (scaled)
+    rPumpHzFb        : REAL;   // gear-pump ACTUAL speed [Hz]       // AT %I* (scaled)
+                               // VFD speed feedback - the MEASURED counterpart of
+                               // the rPumpHz setpoint below. The mimic (pump circle
+                               // + Hz readout) shows this, never the command, so a
+                               // dead drive cannot look like a running one.
 
     // ============ DIGITAL OUTPUTS (0-24 V) ============
     bAirValve  AT %Q*      : BOOL;   // air valve solenoid                // AT %Q*

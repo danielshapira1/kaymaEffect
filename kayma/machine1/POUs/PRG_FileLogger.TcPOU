@@ -50,6 +50,7 @@ VAR
     bPrevManSPX    : BOOL;
     bPrevManPOpen  : BOOL;
     bPrevManPClose : BOOL;
+    bPrevManPump   : BOOL;
     rPrevManHz     : REAL := 15.0; // matches PRG_Spray init -> no ghost line at boot
 
     // ---- process-warning edges + chatter cooldowns ----
@@ -195,6 +196,10 @@ IF PRG_Spray.bManualActive THEN
         IF PRG_Spray.bManPistonClose THEN fbLog.Info('MAN: Piston-close sol ON');
         ELSE fbLog.Info('MAN: Piston-close sol OFF'); END_IF
     END_IF
+    IF PRG_Spray.bManPump <> bPrevManPump THEN
+        IF PRG_Spray.bManPump THEN fbLog.Info('MAN: Pump RUN');
+        ELSE fbLog.Info('MAN: Pump STOP'); END_IF
+    END_IF
     IF ABS(PRG_Spray.rManPumpHz - rPrevManHz) > 0.05 THEN
         sTxt := 'MAN: Pump ';
         sTxt := CONCAT(sTxt, LREAL_TO_FMTSTR(REAL_TO_LREAL(PRG_Spray.rManPumpHz), 1, TRUE));
@@ -207,6 +212,7 @@ bPrevManAir    := PRG_Spray.bManAirValve;
 bPrevManSPX    := PRG_Spray.bManSPXValve;
 bPrevManPOpen  := PRG_Spray.bManPistonOpen;
 bPrevManPClose := PRG_Spray.bManPistonClose;
+bPrevManPump   := PRG_Spray.bManPump;
 rPrevManHz     := PRG_Spray.rManPumpHz;
 
 //------------------------------------------------------------------

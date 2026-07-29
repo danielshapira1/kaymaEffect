@@ -10,8 +10,9 @@
 //
 // bSimEnable is the ONE switch: it is what the 'SIM VALUES / REAL
 // VALUES' button on the spray screen toggles, and it covers every
-// process input at once (level, pressures, valve traffic-light,
-// piston sensors, mold-at-height, mother handshake). On the falling
+// process input at once (level, pressures, pump speed feedback, valve
+// traffic-light, piston sensors, mold-at-height, mother handshake).
+// On the falling
 // edge the simulated values are dropped rather than left latched -
 // see the release block at the top of the implementation.
 //==================================================================
@@ -32,6 +33,12 @@ VAR
     tSimValveStroke  : TIME := T#300MS;  // SPX valve open/close (< T2 / T6 = 0.5 s)
     tSimMoldMove     : TIME := T#1S;     // mother moves mold to spray height (< T1 = 4 s)
     tSimStartGap     : TIME := T#2S;     // settle time before the demo auto-kick
+
+    // ---- simulated VFD speed feedback ----
+    rSimPumpLag      : REAL := 0.15;  // per-scan approach factor -> spin-up/down
+    rSimPumpZero     : REAL := 0.5;   // [Hz] snap the lag tail to 0 below this.
+                                      // Keep at/below PRG_Spray.rPUMP_RUN_MIN, the
+                                      // threshold the mimic calls 'stopped'.
 
     // ---- timers ----
     tonPOpen   : TON;
@@ -61,6 +68,7 @@ IF NOT bSimEnable THEN
     IF ftSimOff.Q THEN
         GVL_IO.rSPXPressure     := 0.0;
         GVL_IO.rAirPressure     := 0.0;
+        GVL_IO.rPumpHzFb        := 0.0;
         GVL_IO.bSPXFullyOpen    := FALSE;
         GVL_IO.bSPXFullyClose   := FALSE;
         GVL_IO.bPistonOpen      := FALSE;
@@ -131,6 +139,21 @@ IF GVL_IO.bAirValve THEN
     GVL_IO.rAirPressure := GVL_IO.rAirPressure + (28.0 - GVL_IO.rAirPressure) * 0.3;
 ELSE
     GVL_IO.rAirPressure := GVL_IO.rAirPressure + (5.0 - GVL_IO.rAirPressure) * 0.1;
+END_IF
+
+//------------------------------------------------------------------
+// Gear-pump speed feedback: first-order lag toward the VFD setpoint,
+// i.e. spin-up and spin-down instead of an instant jump. The setpoint
+// read here is the one written LAST scan (PRG_Process / PRG_Spray both
+// run after this program), which is the right way round - a real drive
+// reports where it has got to, not where it was just told to go.
+// Snapped to exactly 0 below the run threshold: the lag is asymptotic,
+// and a stopped pump must read zero rather than leave a tail that
+// keeps the mimic circle green forever.
+//------------------------------------------------------------------
+GVL_IO.rPumpHzFb := GVL_IO.rPumpHzFb + (GVL_IO.rPumpHz - GVL_IO.rPumpHzFb) * rSimPumpLag;
+IF GVL_IO.rPumpHz <= 0.0 AND GVL_IO.rPumpHzFb < rSimPumpZero THEN
+    GVL_IO.rPumpHzFb := 0.0;
 END_IF
 
 //------------------------------------------------------------------
