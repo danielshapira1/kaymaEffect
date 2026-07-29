@@ -71,6 +71,13 @@ VAR
     sErrorText  : STRING;
     sWarnText   : STRING;
 
+    // ---- SIM / REAL source indicator (section 4b) ----
+    //   The button on the screen toggles SIM_Plant.bSimEnable, so its
+    //   caption has to state which source every readout below it comes
+    //   from - a simulated 63 % looks exactly like a measured 63 %.
+    sSimBtnText : STRING := 'SIM VALUES';   // 'SIM VALUES' <-> 'REAL VALUES'
+    cSimBtn     : DWORD;                    // yellow while simulating
+
     // ---- live readouts mirrored for the HMI ----
     rPumpHz      : REAL;
     rSPXLevel    : REAL;
@@ -112,8 +119,9 @@ VAR CONSTANT
     cGREEN  : DWORD := 16#FF46A758;   // open / auto / OK
     cGREY   : DWORD := 16#FF8A8F98;   // closed
     cRED    : DWORD := 16#FFE5484D;   // in transit / fault
-    cYELLOW : DWORD := 16#FFF2C94C;   // manual
+    cYELLOW : DWORD := 16#FFF2C94C;   // manual / simulated values
 	cBLACK  : DWORD := 16#FF000000;
+	cWHITE  : DWORD := 16#FFFFFFFF;   // default button fill (matches the style)
 
     // ---- clean-mode steps ----
     nCLEAN_OFF       : INT := 0;   // clean mode not active
@@ -248,6 +256,24 @@ ELSIF MAIN.bAutoMode THEN
     cModeColor := cGREEN;  sModeText := 'AUTO';
 ELSE
     cModeColor := cYELLOW; sModeText := 'MANUAL';
+END_IF
+
+//==================================================================
+// 4b) SIM / REAL INDICATOR
+//   SIM_Plant.bSimEnable is the single master: while it is TRUE the
+//   simulator writes EVERY process input (level, SPX + air pressure,
+//   valve traffic-light, piston sensors, mold-at-height, mother
+//   handshake) and the pump Hz below is therefore computed from
+//   simulated pressure. Nothing on the mimic distinguishes those from
+//   measured values, so the button that toggles the flag states the
+//   source itself and goes yellow while the screen is lying.
+//==================================================================
+IF SIM_Plant.bSimEnable THEN
+    sSimBtnText := 'SIM VALUES';
+    cSimBtn     := cYELLOW;
+ELSE
+    sSimBtnText := 'REAL VALUES';
+    cSimBtn     := cWHITE;
 END_IF
 
 //------------------------------------------------------------------

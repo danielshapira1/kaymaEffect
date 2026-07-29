@@ -42,6 +42,7 @@ VAR
     // ---- previous-scan copies for change detection ----
     ePrevState : E_SeqState := E_SeqState.eIdle;
     bPrevAuto  : BOOL;
+    bPrevSim   : BOOL := TRUE;     // matches SIM_Plant.bSimEnable init -> no ghost line at boot
     nLastFault : INT;              // captured on fault entry (MAIN clears nErrorCode on reset)
 
     // ---- manual-mode presses ----
@@ -207,6 +208,23 @@ bPrevManSPX    := PRG_Spray.bManSPXValve;
 bPrevManPOpen  := PRG_Spray.bManPistonOpen;
 bPrevManPClose := PRG_Spray.bManPistonClose;
 rPrevManHz     := PRG_Spray.rManPumpHz;
+
+//------------------------------------------------------------------
+// 2c) SIM / REAL SOURCE SWITCH  (SIM_Plant.bSimEnable - HMI button)
+//     Deserves its own line: every figure in the messages around it -
+//     level, SPX/air pressure, pump Hz - changes meaning with this
+//     flag, so a log read after the fact must say which source was
+//     live. Gated on bStartupLogged: the boot state is reported by
+//     section 0, and this must not repeat it as a "switch".
+//------------------------------------------------------------------
+IF bStartupLogged AND (SIM_Plant.bSimEnable <> bPrevSim) THEN
+    IF SIM_Plant.bSimEnable THEN
+        fbLog.Warn('Source -> SIMULATION: readouts are simulated, not measured');
+    ELSE
+        fbLog.Info('Source -> REAL I/O: simulated inputs released');
+    END_IF
+END_IF
+bPrevSim := SIM_Plant.bSimEnable;
 
 //------------------------------------------------------------------
 // 3) PROCESS WARNINGS  (non-latching flags from GVL_Process)

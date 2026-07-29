@@ -7,12 +7,19 @@
 // so the aligned sequence can run without hardware. Stroke/valve times
 // are set INSIDE the watchdog limits (T2/T3/T4/T6) so a clean demo
 // never faults. Set bSimEnable := FALSE for real I/O.
+//
+// bSimEnable is the ONE switch: it is what the 'SIM VALUES / REAL
+// VALUES' button on the spray screen toggles, and it covers every
+// process input at once (level, pressures, valve traffic-light,
+// piston sensors, mold-at-height, mother handshake). On the falling
+// edge the simulated values are dropped rather than left latched -
+// see the release block at the top of the implementation.
 //==================================================================
 VAR
-    bSimEnable       : BOOL := TRUE;     // master enable
+    bSimEnable       : BOOL := TRUE;     // master enable (HMI: 'SIM VALUES' button)
     bSimAutoStart    : BOOL := FALSE;    // TRUE = kick the machine into AUTO once (demo).
                                          // Default FALSE: boots in MANUAL, as specified.
-	bSimLevelActive : BOOL := TRUE;   // TRUE = simulate, FALSE = real sensor
+	ftSimOff        : F_TRIG;         // SIM -> REAL edge (release the sim values)
     fSimLevel       : REAL := 20.0;   // simulated level [%]
     fSimRate        : REAL := 5.0;    // rate of change [% per second]
     bSimUp          : BOOL := TRUE;   // TRUE = filling, FALSE = draining
@@ -38,8 +45,32 @@ VAR
 END_VAR
 ]]></Declaration>
     <Implementation>
-      <ST><![CDATA[// Simulation off -> leave every input to the real I/O.
+      <ST><![CDATA[//------------------------------------------------------------------
+// Simulation off -> leave every input to the real I/O.
+//   On the SIM -> REAL edge the values this program was writing are
+//   cleared. Without that they stay latched at their last simulated
+//   figure and keep reading like live measurements - the piston lamps
+//   stay green, SPX still shows 1.72 bar - which is exactly the trap
+//   the sim/real button exists to prevent. Zeroed inputs make an
+//   unmapped or dead channel obvious immediately (and, in AUTO, the
+//   existing watchdogs fault the cycle instead of running blind).
+//------------------------------------------------------------------
+ftSimOff(CLK := bSimEnable);
+
 IF NOT bSimEnable THEN
+    IF ftSimOff.Q THEN
+        GVL_IO.rSPXPressure     := 0.0;
+        GVL_IO.rAirPressure     := 0.0;
+        GVL_IO.bSPXFullyOpen    := FALSE;
+        GVL_IO.bSPXFullyClose   := FALSE;
+        GVL_IO.bPistonOpen      := FALSE;
+        GVL_IO.bPistonClosed    := FALSE;
+        GVL_IO.bMoldAtSprayHigh := FALSE;
+        GVL_IO.bSprayFeasible   := FALSE;
+        GVL_IO.bAutoToggleHW    := FALSE;
+        // rSPXLevel is not cleared here: MAIN scales it from the real
+        // iSPXLevelRaw channel every scan as soon as sim is off.
+    END_IF
     RETURN;
 END_IF
 
@@ -119,26 +150,25 @@ fDt   := TIME_TO_REAL(TIME() - tLast) / 1000.0;
 tLast := TIME();
 fDt   := LIMIT(0.0, fDt, 0.1);   // guard against the first-cycle jump
 
-IF bSimLevelActive THEN
-    IF bSimUp THEN
-        fSimLevel := fSimLevel + fSimRate * fDt;
-        IF fSimLevel >= 90.0 THEN
-            fSimLevel := 90.0;
-            bSimUp    := FALSE;      // top reached -> drain
-        END_IF
-    ELSE
-        fSimLevel := fSimLevel - fSimRate * fDt;
-        IF fSimLevel <= 21.0 THEN
-            fSimLevel := 21.0;
-            bSimUp    := TRUE;       // bottom reached -> fill
-        END_IF
+// Level ramp - unconditional while simulating, like every other value
+// this program drives. (There used to be a bSimLevelActive sub-flag
+// that could hold the level on the real channel while the rest of the
+// screen was simulated; with bSimEnable on the HMI it was a second,
+// unreachable switch that silently froze the level. One switch only.)
+IF bSimUp THEN
+    fSimLevel := fSimLevel + fSimRate * fDt;
+    IF fSimLevel >= 90.0 THEN
+        fSimLevel := 90.0;
+        bSimUp    := FALSE;      // top reached -> drain
     END_IF
-    GVL_IO.rSPXLevel := fSimLevel;
+ELSE
+    fSimLevel := fSimLevel - fSimRate * fDt;
+    IF fSimLevel <= 21.0 THEN
+        fSimLevel := 21.0;
+        bSimUp    := TRUE;       // bottom reached -> fill
+    END_IF
 END_IF
-
-IF NOT bSimLevelActive THEN
-    GVL_IO.rSPXLevel := INT_TO_REAL(GVL_IO.iSPXLevelRaw) * 100.0 / 32767.0;
-END_IF
+GVL_IO.rSPXLevel := fSimLevel;
 ]]></ST>
     </Implementation>
   </POU>

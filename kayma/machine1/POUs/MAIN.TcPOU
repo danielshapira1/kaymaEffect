@@ -56,12 +56,16 @@ END_VAR]]></Declaration>
 // 'busy' so the mother resumes. The cycle is handshake-gated, not free-
 // running: each casting cycle the mother hands us control exactly once.
 //==================================================================
-SIM_Plant();    // drives GVL_IO inputs; set SIM_Plant.bSimEnable:=FALSE for real HW
+SIM_Plant();    // drives GVL_IO inputs; bSimEnable is the sim/real master (HMI button)
 
-// Scale EL3054 raw (0..32767 = 4..20 mA) -> SPX tank level [%]
-IF NOT SIM_Plant.bSimLevelActive THEN
-GVL_IO.rSPXLevel := INT_TO_REAL(GVL_IO.iSPXLevelRaw) * (100.0 / 32767.0);
-END_IF;
+// Scale EL3054 raw (0..32767 = 4..20 mA) -> SPX tank level [%].
+// Only with REAL VALUES selected: while simulating, SIM_Plant ramps
+// rSPXLevel and this must not overwrite it. Same single flag that
+// gates every other input, so the level can never end up on a
+// different source than the rest of the screen.
+IF NOT SIM_Plant.bSimEnable THEN
+    GVL_IO.rSPXLevel := INT_TO_REAL(GVL_IO.iSPXLevelRaw) * (100.0 / 32767.0);
+END_IF
 
 // Edge detectors (HW inputs OR-ed with the HMI buttons from PRG_Spray).
 rtAuto (CLK := GVL_IO.bAutoToggleHW OR PRG_Spray.bCmdAuto);
